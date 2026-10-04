@@ -1,7 +1,6 @@
 package com.yunsmall.usbipdcpp
 
 import android.content.Context
-import com.yunsmall.usbipdcpp.R
 
 /**
  * 设备操作结果

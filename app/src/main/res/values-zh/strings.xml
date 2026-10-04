@@ -41,6 +41,7 @@
     <string name="invalid_port">端口需在 1-65535 之间</string>
     <string name="permission_denied">权限被拒绝</string>
     <string name="device_unavailable">设备不可用（可能被系统占用）</string>
+    <string name="camera_permission_denied">需要相机权限才能绑定该设备</string>
     <string name="bind_success">绑定成功: %1$s</string>
     <string name="bind_failed">绑定失败: %1$s</string>
     <string name="unbind_success">已解绑: %1$s</string>

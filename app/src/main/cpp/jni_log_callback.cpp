@@ -8,6 +8,16 @@ namespace {
     JavaVM* g_jvm = nullptr;
     jobject g_callback_obj = nullptr;
     jmethodID g_log_method = nullptr;
+    // 与 usbipd_jni.cpp 的 LOG_TAG 一致，便于 logcat 按同一标签过滤本模块输出
+    constexpr char LOG_TAG[] = "UsbIpNative";
+
+    // detach 的统一出口：失败（如 JNI_EDETACHED）只记一行，避免排查
+    // attach/detach 泄漏时缺线索
+    void detach_if_needed(JavaVM* jvm, bool need_detach) {
+        if (need_detach && jvm->DetachCurrentThread() != JNI_OK) {
+            __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "jni_log: DetachCurrentThread failed");
+        }
+    }
     // 保护 g_callback_obj 等全局：cleanup 删除全局引用时，log_callback
     // 可能正由 usbipdcpp 的日志线程执行，不用锁会访问已释放的引用
     std::mutex g_mutex;
@@ -57,7 +67,9 @@ void cleanup(JNIEnv* env) {
 }
 
 void log_callback(spdlog::level::level_enum level, const std::string& message) {
-    // 锁内只派生本地引用并拷贝所需值，JNI 调用放锁外：
+    // 锁内白名单：只允许不阻塞、且不会重入本锁的 JNI 调用（GetEnv、
+    // AttachCurrentThread、NewLocalRef、读缓存的 methodID）；其余 JNI 调用
+    //（NewStringUTF、CallVoidMethod 等）一律放锁外：
     // - 本地引用独立引用计数，锁外调用期间 cleanup 删除全局引用对象仍存活
     //   （快照裸指针方案在这里是 use-after-free，不能用于缩小锁范围）
     // - 锁外执行用户代码，Kotlin 回调未来即使同步触发 native 日志也不会死锁
@@ -71,8 +83,11 @@ void log_callback(spdlog::level::level_enum level, const std::string& message) {
         if (!g_jvm || !g_callback_obj || !g_log_method) return;
         jvm = g_jvm;
 
-        // attach 放锁内执行：JVM 的 attach 只建线程局部表、不执行 Java 代码，
-        // 不会回调用户逻辑；需要 GetEnv 后才能在锁内派生本地引用
+        // attach 放锁内执行：ART 的实现会创建 java.lang.Thread 的 peer 对象，
+        // 但该路径不经过本模块的日志回调（唯一会重入 g_mutex 的是 spdlog
+        // 输出），不存在同线程二次加锁；且需要 GetEnv 后才能在锁内派生本地引用。
+        // 锁外 attach 的方案（取 jvm→解锁→attach→回锁派生引用）要在回锁后
+        // 重新处理"回调已被 cleanup 清掉"的窗口，复杂度换不来实际收益
         int get_env_result = jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
         if (get_env_result == JNI_EDETACHED) {
             // 用完即 detach 而不缓存 attach 状态：日志线程由库创建，线程退出时
@@ -81,36 +96,49 @@ void log_callback(spdlog::level::level_enum level, const std::string& message) {
             if (jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
                 need_detach = true;
             } else {
+                // 拿不到 env：本条日志只能丢弃，打一行便于从 logcat 排查线程状态异常
+                __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "jni_log: AttachCurrentThread failed");
                 return;
             }
         } else if (get_env_result != JNI_OK) {
+            // 同 attach 失败：JNI_EVERSION 等意味着本线程拿不到可用 env，
+            // 日志被静默丢弃，打一行便于排查 ROM 兼容问题
+            __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "jni_log: GetEnv failed: %d", get_env_result);
             return;
         }
 
+        // 这里是"JNI 调用放锁外"的例外：NewLocalRef 只碰引用表、不执行
+        // 用户代码也不阻塞（同锁内 attach 的理由），故允许在锁内派生
         callback = env->NewLocalRef(g_callback_obj);
         method = g_log_method;
     }
-    if (!env || !callback || !method) {
+    // env 为空只可能是 JVM 行为异常（正常实现下 attach/GetEnv 成功时必然给出
+    // 有效 env，此时 need_detach 也不会置位），单独短路以免下方逻辑依赖
+    // "env 非空"这个不可达假设；若违约实现里 attach 报成功却没写 env，
+    // need_detach 已置位，照样 detach，出口与下方分支保持一致
+    if (!env) {
+        detach_if_needed(jvm, need_detach);
+        return;
+    }
+    if (!callback || !method) {
         // NewLocalRef 失败（OOM）会挂起 OutOfMemoryError，必须清掉：异常残留在
         // 已 attach 的线程上（如发起调用的 UI 线程）会破坏其后续 JNI 调用。
         // 已 attach 的线程必须 detach，否则线程永久附加在 JVM 上
-        if (env) {
-            env->ExceptionClear();
-        }
-        if (need_detach) {
-            jvm->DetachCurrentThread();
-        }
+        env->ExceptionClear();
+        detach_if_needed(jvm, need_detach);
         return;
     }
 
+    // NewStringUTF 按 NUL 结尾语义转换：消息若含内嵌 NUL（格式化参数带入的
+    // 理论情形）会被截断，只影响这一条日志的显示，不做额外检测。
+    // 四字节 UTF-8（如 emoji）无需担心：ART 的 NewStringUTF 接受标准 UTF-8，
+    // 会正确转换为代理对（比 JNI 规范要求的 modified UTF-8 更宽容）
     jstring jmessage = env->NewStringUTF(message.c_str());
     if (!jmessage) {
         // OOM 时 NewStringUTF 返回 null 并挂 OutOfMemoryError，清掉避免残留
         env->ExceptionClear();
         env->DeleteLocalRef(callback);
-        if (need_detach) {
-            jvm->DetachCurrentThread();
-        }
+        detach_if_needed(jvm, need_detach);
         return;
     }
 
@@ -124,9 +152,7 @@ void log_callback(spdlog::level::level_enum level, const std::string& message) {
         env->ExceptionClear();
     }
 
-    if (need_detach) {
-        jvm->DetachCurrentThread();
-    }
+    detach_if_needed(jvm, need_detach);
 }
 
 } // namespace jni_log

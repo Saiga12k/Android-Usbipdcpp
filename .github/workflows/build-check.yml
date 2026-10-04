@@ -23,6 +23,27 @@ jobs:
         with:
           submodules: recursive
 
+      - name: 校验 JNI 错误码与 Kotlin 镜像一致
+        run: |
+          # ErrorCode 是跨语言镜像（C++ 值经 JNI 原样传给 Kotlin），两边注释
+          # 互相提醒但编译期发现不了漏改，这里做静态比对。提取限定在各自的
+          # ErrorCode 定义块内：文件里新增其他常量不会被误抓。块内行格式若
+          # 改变需要同步调整正则；提取为空会直接失败而不是静默通过
+          cpp=$(awk '/^namespace ErrorCode \{/,/^\}/' app/src/main/cpp/usbipd_jni.cpp \
+            | grep -oE 'constexpr int [A-Z_]+ = [0-9]+' | sed 's/constexpr int //' | sort)
+          kotlin=$(awk '/object ErrorCode \{/,/^\s*\}/' app/src/main/java/com/yunsmall/usbipdcpp/UsbIpNative.kt \
+            | grep -oE 'const val [A-Z_]+ = [0-9]+' | sed 's/const val //' | sort)
+          if [ -z "$cpp" ] || [ -z "$kotlin" ]; then
+            echo "::error::ErrorCode 提取为空（定义块格式疑似变化，检查本步的正则）"
+            exit 1
+          fi
+          if [ "$cpp" != "$kotlin" ]; then
+            echo "::error::ErrorCode 两侧不一致（左 C++，右 Kotlin）："
+            diff <(echo "$cpp") <(echo "$kotlin") || true
+            exit 1
+          fi
+          echo "ErrorCode 一致：$(echo "$cpp" | grep -c '=') 项"
+
       - name: 设置 JDK 17
         uses: actions/setup-java@v4
         with:

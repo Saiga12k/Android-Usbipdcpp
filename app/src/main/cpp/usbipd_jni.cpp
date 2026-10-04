@@ -43,6 +43,24 @@ namespace {
     bool g_initialized = false;
     bool g_server_running = false;
 
+    // 幂等 libusb 初始化，调用方须持有 g_server_mutex。nativeInitImpl 与
+    // startServerImpl 共用：init 与启动的其他状态操作落在同一临界区内，
+    // 中间没有释放锁的窗口，"g_initialized 全部在锁内维护"不依赖调用方串行
+    bool try_init_locked() {
+        if (g_initialized) {
+            return true;
+        }
+        libusb_set_option(nullptr, LIBUSB_OPTION_WEAK_AUTHORITY);
+        int err = libusb_init(nullptr);
+        if (err < 0) {
+            __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Failed to initialize libusb: %s", libusb_strerror(err));
+            // 未置位，允许下次重试
+            return false;
+        }
+        g_initialized = true;
+        return true;
+    }
+
     int toErrorCode(usbipdcpp::DeviceOperationResult result) {
         using namespace usbipdcpp;
         switch (result) {
@@ -82,22 +100,14 @@ Java_com_yunsmall_usbipdcpp_UsbIpNative_nativeInitImpl(JNIEnv* env, jobject thiz
     // 直接看到"已初始化"。不用原子 CAS：它只保证初始化执行一次而不保证已完成，后来的
     // 调用会乐观返回"已初始化"，而 libusb 可能尚未就绪
     std::lock_guard<std::mutex> lock(g_server_mutex);
-    if (g_initialized) {
-        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Already initialized");
-        return JNI_TRUE;
-    }
-
-    libusb_set_option(nullptr, LIBUSB_OPTION_WEAK_AUTHORITY);
-
-    int err = libusb_init(nullptr);
-    if (err < 0) {
-        __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Failed to initialize libusb: %s", libusb_strerror(err));
-        // 未置位，允许下次重试
+    // 快照必须在 try_init_locked 之前取：它幂等，成功返回后 g_initialized 恒为
+    // true，之后再读就分不出"本次真做了初始化"与"之前已初始化"
+    bool was_initialized = g_initialized;
+    if (!try_init_locked()) {
         return JNI_FALSE;
     }
-
-    g_initialized = true;
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Native layer initialized successfully");
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                        was_initialized ? "Already initialized" : "Native layer initialized successfully");
     return JNI_TRUE;
 }
 
@@ -146,14 +156,17 @@ Java_com_yunsmall_usbipdcpp_UsbIpNative_setLogCallbackImpl(JNIEnv* env, jobject 
         auto android_sink = std::make_shared<spdlog::sinks::android_sink_mt>("usbipdcpp");
         auto jni_sink = std::make_shared<jni_callback_sink_mt>(jni_log::log_callback);
 
-        // 每次重建（Activity 旋转/重启）都新建 logger 替换 default：旧 logger 由
-        // set_default_logger 释放 default 引用后随 shared_ptr 引用计数析构，
-        // 不经过 registry 也不会泄漏
+        // 每次重建（Activity 旋转/重启）都新建 logger 替换 default：set_default_logger
+        // 会同时把新 logger 注册进 registry（loggers_[name]）并设为 default，两处
+        // 都是同名替换——旧 logger 的两个 registry 引用全被顶掉，引用计数归零
+        // 析构，不会逐次累积
         auto logger = std::make_shared<spdlog::logger>("usbipdcpp", spdlog::sinks_init_list{android_sink, jni_sink});
         logger->set_level(spdlog::level::debug);
 
         bool installed = jni_log::init(env, callback_global, log_method);
-        // init 无论成败都不再由本函数持有该引用（失败时它已当场释放）
+        // init 无论成败都不再由本函数持有该引用（失败时它已当场释放）；
+        // 唯一例外是 init 抛出（取锁失败）——"抛出即未接管"（契约见
+        // jni_log_callback.h），引用仍在手上，由 catch 依 callback_ref_owned 释放
         callback_ref_owned = false;
         if (!installed) {
             // 回调没装上：保持旧 logger 不动，避免出现"新 logger 已生效但回调
@@ -162,7 +175,15 @@ Java_com_yunsmall_usbipdcpp_UsbIpNative_setLogCallbackImpl(JNIEnv* env, jobject 
             return;
         }
 
+        // init 与 set_default_logger 之间的窗口（回调已换、default 仍是旧
+        // logger）无害：两代 logger 的 jni sink 都经 jni_log 全局查表取当前
+        // 回调，窗口内日志照常送到新回调，不会落回旧 Activity。跨代一致性不
+        // 靠这里保证——回调更替本就跨 set(null)、set(新) 两次调用
         spdlog::set_default_logger(logger);
+        // spdlog::set_pattern 的实际链路：set_formatter → registry::set_formatter
+        // 遍历已注册 logger → logger 逐个 sink 设置 formatter（formatter 归属
+        // sink，非 logger）。上一行 set_default_logger 已把本 logger 注册进
+        // registry，遍历必然命中：android_sink 与 jni_sink 都按此 pattern 输出
         spdlog::set_pattern("[%H:%M:%S] [%l] %v");
 
         __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Log callback set");
@@ -182,6 +203,48 @@ Java_com_yunsmall_usbipdcpp_UsbIpNative_setLogCallbackImpl(JNIEnv* env, jobject 
 JNIEXPORT jint JNICALL
 Java_com_yunsmall_usbipdcpp_UsbIpNative_bindUsbDeviceImpl(
     JNIEnv* env, jobject thiz, jint fd, jint vendor_id, jint product_id, jobjectArray outBusid) {
+
+    // busid 与 rollback 定义在 try 外：外层 catch 也要用——库若在绑定完成之后
+    // 抛异常（当前实现里绑定动作之后已无可抛点，防其演进），已落库的绑定
+    // 必须尽力回滚
+    std::string busid;
+    // 交付失败按 busid 兜底移除：fd 解绑失败说明 fd 匹配已不可靠，
+    // notify_device_removed 走 busid 键，是独立于 fd 的第二条清理路径。
+    // noexcept + 内层 try：回滚自身再抛异常同样不能穿越边界，那样连"设备残留"
+    // 都没人知道，至少要留下日志。
+    // 调用方必须持有 g_server_mutex（LibusbServer 无锁，所有调用须串行）；
+    // busid 走参数、fd 按值捕获：lambda 不持有任何栈上引用，即便将来被外带
+    //（包成 std::function 等）也不会悬空
+    auto rollback = [fd](const std::string& busid) noexcept {
+        // g_server 检查之前的异常同样会落到 catch
+        if (!g_server) {
+            return;
+        }
+        try {
+            if (g_server->unbind_host_device_by_fd(static_cast<intptr_t>(fd)) == usbipdcpp::DeviceOperationResult::Success) {
+                return;
+            }
+            // busid 为空说明异常发生在取到 busid 之前——取 busid（get_device_busid）
+            // 自身失败也是这一情形，此时没有按 busid 可兜底的对象，跳过是预期；
+            // 顺带免去一次空键查询
+            if (busid.empty()) {
+                return;
+            }
+            auto notify_result = g_server->notify_device_removed(busid);
+            // 本 lambda 声明 noexcept：内部记日志一律用 __android_log_print
+            //（libc 函数，无 C++ 异常契约）——spdlog 不能出现在"绝对不抛"的承诺里
+            if (notify_result == usbipdcpp::DeviceOperationResult::Success) {
+                __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Rollback: fd unbind failed, busid fallback succeeded");
+            } else {
+                // 两条路径都失败：native 侧留下孤儿设备，需要人工关注
+                __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Rollback failed by both fd and busid: %d", static_cast<int>(notify_result));
+            }
+        } catch (const std::exception& e) {
+            __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Rollback threw: %s", e.what());
+        } catch (...) {
+            __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Rollback threw unknown exception");
+        }
+    };
 
     // 整体兜底：库调用与 std::string 分配都可能抛（如 bad_alloc），C++ 异常穿越
     // extern "C" 的 JNI 边界时 ART 无法 unwind，会直接 terminate
@@ -222,7 +285,6 @@ Java_com_yunsmall_usbipdcpp_UsbIpNative_bindUsbDeviceImpl(
         // 临时 handle 用 RAII 托管：get_device_busid 的 std::string 构造可能抛，
         // 走外层 catch 时不能漏掉 libusb_close。作用域限定在取 busid 这段，
         // 之后的绑定要在"临时 handle 已关闭"的状态下进行
-        std::string busid;
         {
             struct TempHandleGuard {
                 libusb_device_handle* handle;
@@ -247,31 +309,13 @@ Java_com_yunsmall_usbipdcpp_UsbIpNative_bindUsbDeviceImpl(
 
         spdlog::info("Device bound successfully: {}", busid);
 
-        // 交付失败按 busid 兜底移除：fd 解绑失败时 fd 匹配已不可靠，
-        // notify_device_removed 走 busid 键，是独立于 fd 的第二条清理路径。
-        // noexcept + 内层 try：回滚自身再抛异常同样不能穿越边界，那样连"设备残留"
-        // 都没人知道，至少要留下日志
-        auto rollback = [&]() noexcept {
-            try {
-                if (g_server->unbind_host_device_by_fd(static_cast<intptr_t>(fd)) == usbipdcpp::DeviceOperationResult::Success) {
-                    return;
-                }
-                auto notify_result = g_server->notify_device_removed(busid);
-                spdlog::warn("Rollback by fd failed, busid fallback result: {}", static_cast<int>(notify_result));
-            } catch (const std::exception& e) {
-                spdlog::error("Rollback threw: {}", e.what());
-            } catch (...) {
-                spdlog::error("Rollback threw unknown exception");
-            }
-        };
-
         // 输出 busid（数组有效性已在入口校验）
         jstring busid_str = env->NewStringUTF(busid.c_str());
         if (busid_str == nullptr) {
             // OOM 时 NewStringUTF 返回 null：写 null 进数组会让 Kotlin 侧
             // outBusid[0]!! 抛 NPE，回滚绑定并返回错误
             env->ExceptionClear();
-            rollback();
+            rollback(busid);
             return ErrorCode::UNKNOWN_ERROR;
         }
         env->SetObjectArrayElement(outBusid, 0, busid_str);
@@ -282,24 +326,39 @@ Java_com_yunsmall_usbipdcpp_UsbIpNative_bindUsbDeviceImpl(
         // 否则调用方拿不到 busid 也没法解绑（正常参数下 SetObjectArrayElement 不会失败）
         if (env->ExceptionCheck()) {
             env->ExceptionClear();
-            rollback();
+            rollback(busid);
             return ErrorCode::UNKNOWN_ERROR;
         }
 
         return ErrorCode::SUCCESS;
     } catch (const std::exception& e) {
-        spdlog::error("bindUsbDevice threw exception: {}", e.what());
+        __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "bindUsbDevice threw exception: %s", e.what());
+        // 异常传到此处时 try 内的锁已随栈展开释放，重新持锁再回滚（rollback
+        // 要求调用方持锁）；绑定未发生时 unbind 查无此 fd，走 notify 兜底
+        // 也是无害的 no-op。这里是最后一道防线：日志用 __android_log_print、
+        // 试锁再包一层 try，任何后续抛出都会穿越 extern "C" 边界，只允许
+        // 记日志后放弃回滚
+        try {
+            std::lock_guard<std::mutex> lock(g_server_mutex);
+            rollback(busid);
+        } catch (...) {
+            __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "bindUsbDevice rollback skipped: lock acquisition threw");
+        }
         return ErrorCode::UNKNOWN_ERROR;
     } catch (...) {
-        spdlog::error("bindUsbDevice threw unknown exception");
+        __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "bindUsbDevice threw unknown exception");
+        try {
+            std::lock_guard<std::mutex> lock(g_server_mutex);
+            rollback(busid);
+        } catch (...) {
+            __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "bindUsbDevice rollback skipped: lock acquisition threw");
+        }
         return ErrorCode::UNKNOWN_ERROR;
     }
 }
 
 JNIEXPORT jboolean JNICALL
 Java_com_yunsmall_usbipdcpp_UsbIpNative_startServerImpl(JNIEnv* env, jobject thiz, jint port) {
-
-    spdlog::info("Starting USB/IP server on port {}", port);
 
     // 端口越界直接拒绝：endpoint 内部按 unsigned short 存端口，65536 会回绕成 0
     //（系统随机分配端口），99999 回绕成别的端口，UI 显示与实际监听不一致
@@ -308,14 +367,17 @@ Java_com_yunsmall_usbipdcpp_UsbIpNative_startServerImpl(JNIEnv* env, jobject thi
         return JNI_FALSE;
     }
 
-    // 无条件走一次初始化（幂等，已初始化时立即返回）：g_initialized 受
-    // g_server_mutex 保护，这里尚未持锁不能直接读；JNI 是公共边界，不假设调用方
-    // 一定先调过 nativeInit，自己保证 libusb 就绪，失败就直接返回
-    if (!Java_com_yunsmall_usbipdcpp_UsbIpNative_nativeInitImpl(env, thiz)) {
+    // 无条件做一次初始化（幂等）：JNI 是公共边界，不假设调用方一定先调过
+    // nativeInit，自己保证 libusb 就绪，失败就直接返回。init 与下面的启动检查/
+    // 创建在同一临界区内完成，不依赖"调用方串行"这个跨层假设
+    std::lock_guard<std::mutex> lock(g_server_mutex);
+    if (!try_init_locked()) {
         return JNI_FALSE;
     }
 
-    std::lock_guard<std::mutex> lock(g_server_mutex);
+    // 日志放在校验与 init 之后：只有真正进入启动流程才发这条，端口非法或
+    // 未就绪失败时不产生"即将启动"的误导输出
+    spdlog::info("Starting USB/IP server on port {}", port);
 
     if (g_server_running) {
         // true 只表示"服务器在运行"，不是"本次入参端口启动成功"：
@@ -359,6 +421,8 @@ Java_com_yunsmall_usbipdcpp_UsbIpNative_stopServerImpl(JNIEnv* env, jobject thiz
 
     std::lock_guard<std::mutex> lock(g_server_mutex);
 
+    // || !g_server 是防御分支：按 g_server 声明处的不变量，running 为 true
+    // 时 server 必然存在；这里兜住不变量万一被破坏的情形（免得对空指针 stop）
     if (!g_server_running || !g_server) {
         spdlog::info("Server not running");
         return;
@@ -423,6 +487,12 @@ Java_com_yunsmall_usbipdcpp_UsbIpNative_notifyDeviceRemovedImpl(
 
     // 同 bind/unbind：字符串构造与库调用都可能抛，异常不能穿越 extern "C" 边界
     try {
+        // Kotlin 侧 busid 是非空 String，正常到不了这里；JNI 是公共边界
+        //（反射等入口也可能进来），null 传给 GetStringUTFChars 在 ART 上是 UB
+        if (busid == nullptr) {
+            spdlog::error("notifyDeviceRemoved: busid is null");
+            return;
+        }
         const char* busid_cstr = env->GetStringUTFChars(busid, nullptr);
         if (busid_cstr == nullptr) {
             // OOM：GetStringUTFChars 返回 null 并挂 OutOfMemoryError，
@@ -431,8 +501,16 @@ Java_com_yunsmall_usbipdcpp_UsbIpNative_notifyDeviceRemovedImpl(
             spdlog::error("Failed to get busid string");
             return;
         }
+        // RAII 托管（同 bindUsbDeviceImpl 的 TempHandleGuard）：std::string
+        // 构造可能抛 bad_alloc，走外层 catch 时不能漏 ReleaseStringUTFChars
+        struct UtfCharsGuard {
+            JNIEnv* env;
+            jstring str;
+            const char* cstr;
+            ~UtfCharsGuard() { env->ReleaseStringUTFChars(str, cstr); }
+        } utf_guard{env, busid, busid_cstr};
+
         std::string busid_str(busid_cstr);
-        env->ReleaseStringUTFChars(busid, busid_cstr);
 
         spdlog::info("Notifying device removed: {}", busid_str);
 
@@ -457,22 +535,29 @@ Java_com_yunsmall_usbipdcpp_UsbIpNative_releaseImpl(JNIEnv* env, jobject thiz) {
     try {
         spdlog::info("Releasing native resources");
 
+        // 直接调用同一翻译单元内的 JNI 导出函数：停止逻辑只有一份，
+        // 无需经 env->CallStaticVoidMethod 反射或复制实现
         Java_com_yunsmall_usbipdcpp_UsbIpNative_stopServerImpl(env, thiz);
 
-        // 状态在锁内改，libusb_exit 放锁外：它会停 libusb 的内部事件线程，耗时不可控。
-        // 与 init 的并发不会发生：Kotlin 侧全部 JNI 调用经 nativeDispatcher 串行，
-        // release 是终局操作，之后不会再有 init
+        // 状态清零与 libusb_exit 在同一临界区：exit 若放锁外，另一线程走
+        // try_init_locked 见到 g_initialized=false 会重新 libusb_init，与 exit
+        // 交错。放锁内则 JNI 层自闭环，不依赖"调用方全部串行"这条外部纪律。
+        // 持锁等待的代价可控：stopServerImpl 已 join 库线程并释放全部设备，
+        // exit 只剩资源释放；且此期间状态恒 false，其他调用本就只会快速失败
         bool was_initialized = false;
         {
             std::lock_guard<std::mutex> lock(g_server_mutex);
             was_initialized = g_initialized;
             g_initialized = false;
-        }
-        if (was_initialized) {
-            libusb_exit(nullptr);
+            if (was_initialized) {
+                libusb_exit(nullptr);
+            }
         }
 
-        jni_log::cleanup(env);
+        // 不在这里清 jni_log 回调：回调的 set/清完全由 UI 层配对管理（组合时
+        // set、onDispose 清）。Service 可能先于 Activity 销毁（分屏、被系统
+        // 回收），在此清掉会让仍存活 UI 的日志通路莫名静默；引用该释放时
+        // UI 会释放，进程退出则由系统回收
     } catch (const std::exception& e) {
         __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "release threw: %s", e.what());
     } catch (...) {
