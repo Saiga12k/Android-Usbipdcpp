@@ -6,7 +6,9 @@ import android.content.Context
  * 设备解绑操作结果
  */
 sealed class DeviceUnbindResult {
+    // 解绑成功无负载（object）；绑定成功要携带 busid，见 DeviceBindResult
     object Success : DeviceUnbindResult()
+
     sealed class Failure : DeviceUnbindResult() {
         object DeviceNotFound : Failure()
         object DeviceInUse : Failure()

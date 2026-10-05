@@ -23,7 +23,7 @@ namespace {
     std::mutex g_mutex;
 }
 
-bool init(JNIEnv* env, jobject callback_obj, jmethodID log_method) {
+InitResult init(JNIEnv* env, jobject callback_obj, jmethodID log_method) {
     // MainActivity 的 DisposableEffect 每次重建都会调用 setLogCallback，
     // 不释放旧引用会导致全局引用永久泄漏
     // GetJavaVM 只读 env 内部的 vm 指针（不碰引用表、不阻塞），放锁外执行；
@@ -33,7 +33,7 @@ bool init(JNIEnv* env, jobject callback_obj, jmethodID log_method) {
         // 规范上允许失败（实现上取 env 缓存的 vm 指针，基本不会）：失败时全局
         // 状态保持不变（旧回调继续工作），只把本次的新引用释放掉
         env->DeleteGlobalRef(callback_obj);
-        return false;
+        return InitResult::FailedRefReleased;
     }
     jobject old = nullptr;
     {
@@ -48,7 +48,7 @@ bool init(JNIEnv* env, jobject callback_obj, jmethodID log_method) {
     if (old) {
         env->DeleteGlobalRef(old);
     }
-    return true;
+    return InitResult::Installed;
 }
 
 void cleanup(JNIEnv* env) {

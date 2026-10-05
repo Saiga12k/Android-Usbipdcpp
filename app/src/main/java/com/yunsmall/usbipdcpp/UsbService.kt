@@ -14,6 +14,7 @@ import android.hardware.usb.UsbManager
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlin.concurrent.thread
@@ -153,6 +154,8 @@ class UsbService : Service() {
 
         val filter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // 系统广播不受 RECEIVER_NOT_EXPORTED 限制（其只拦其他应用来源），
+            // 导出反而给伪造"设备拔出"的广播留口
             registerReceiver(deviceDetachedReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
             registerReceiver(deviceDetachedReceiver, filter)
@@ -188,7 +191,8 @@ class UsbService : Service() {
         // GC，不存在 C++ 那样的 use-after-free。
         // 清理线程可能要等正在执行的 native 调用（如 bindDevice 卡在 USB 传输上）
         // 结束，极端情况下等很久；不加超时：onDestroy 是终结路径，线程挂住最坏到
-        // 进程退出由系统回收，而超时会让 release 根本不执行，清理更不完整。
+        // 进程退出由系统回收——Android 的进程退出是系统 kill，与线程是否守护无关
+        //（不设 isDaemon），而超时会让 release 根本不执行，清理更不完整。
         // release 先于 closeAllDevices：release 内部先停服务器，LibusbServer::stop
         // 会把可用与使用中的设备全部 release_and_close/unref（已对照库源码确认），
         // 返回后库已与 fd 无关，再关 UsbDeviceConnection，避免"libusb 仍在用已
@@ -237,28 +241,45 @@ class UsbService : Service() {
             return false
         }
         // 检查、启动与 state 更新在同一临界区内构成事务：临界区外的检查会与
-        // 并发的 startServer 交错——后进入者的入参会把 state.port 覆写成与实际
-        // 监听不一致的值（native 对运行中服务器的调用短路返回 true，success
-        // 为真但端口不是本次的）。UI 的 isStarting 禁用只是防连点，不作为并发
-        // 正确性的依赖；若需要区分"本次入参是否即实际监听端口"，应让 JNI
-        // 返回实际端口，而不是拿入参推断
+        // 并发的 startServer 交错——后进入者会把 state.port 填成与实际监听不
+        // 一致的值。UI 的 isStarting 禁用只是防连点，不作为并发正确性的依赖；
+        // state.port 一律用 JNI 返回的实际监听端口回填，不用入参推断
         return withContext(serviceNativeContext) {
             // 复查销毁标志：入口检查与本块开始之间主线程可能已置位（同 bindDevice）
             if (destroying) {
                 return@withContext false
             }
-            if (state.value.serverRunning) return@withContext true
+            // 已在运行时返回"实际监听端口是否即本次入参"：同端口视为幂等成功，
+            // 不同端口返回 false（服务器并未按入参启动）。比较用的是 state.port
+            // 这个实际值，不是拿入参回填/推断（见上方事务注释）
+            if (state.value.serverRunning) {
+                return@withContext state.value.port == port
+            }
 
-            val success = UsbIpNative.startServer(port)
+            val actualPort = UsbIpNative.startServer(port)
+            val success = actualPort >= 0
             if (success) {
-                _state.update { it.copy(serverRunning = true, port = port) }
+                // 回填 native 返回的实际端口：state 落后于 native（OOM 级更新
+                // 失败使 serverRunning 停在 false 而服务器实际在跑）时本短路口
+                // 不生效，走这里——返回的"已在运行"端口是真实值，显示不错位
+                _state.update { it.copy(serverRunning = true, port = actualPort) }
             }
             success
         }
     }
 
     suspend fun stopServer() {
+        // 同 startServer/bindDevice：销毁开始后拒绝（见 destroying 声明处）——
+        // 清理线程负责停服务器与释放全部资源，此时的停止只会与清理流程重复
+        // 执行，拦下让三个操作入口的销毁语义保持一致
+        if (destroying) {
+            return
+        }
         withContext(serviceNativeContext) {
+            // 复查销毁标志：入口检查与本块开始之间主线程可能已置位（同 bindDevice）
+            if (destroying) {
+                return@withContext
+            }
             try {
                 UsbIpNative.stopServer()
             } finally {
@@ -305,8 +326,8 @@ class UsbService : Service() {
             try {
                 // fd < 0 实际不会出现（openDevice 成功后必有 fd），防御在此：
                 // 返回失败，连接由 finally 统一关闭
-                // getFileDescriptor 是公开 SDK API（API 12 起），非隐藏 API，
-                // 不需要反射兜底
+                // getFileDescriptor 是公开 SDK API（API 12 起），返回 int（原始
+                // fd，不是 FileDescriptor 对象），非隐藏 API，不需要反射兜底
                 val fd = connection.fileDescriptor
                 if (fd < 0) {
                     return@withContext DeviceBindResult.Failure.DeviceOpenFailed
@@ -317,8 +338,11 @@ class UsbService : Service() {
                         activeDevices[device.deviceName] = DeviceInfo(connection, fd, result.busid)
                         // 登记成功即接管连接所有权（finally 据此决定关不关连接）。
                         // registered 的置位点精确对齐"登记成功"：put 失败（OOM 级）
-                        // 时仍为 false，finally 关掉未登记的连接；提前置位反而会让
-                        // 失败时连接绕过 finally 外逃。置位又必须先于 state 更新：
+                        // 时仍为 false，finally 关掉未登记的连接（native 侧此时已
+                        // 持有绑定、无人登记，残留由 stopServer/拔出/release 的
+                        // 统一回收链兜底；能走到这里就是 OOM 级，不再加 unbind
+                        // 兜底）；提前置位反而会让失败时连接绕过 finally 外逃。
+                        // 置位又必须先于 state 更新：
                         // state 失败同样不回滚登记，连接已归设备表管就不能再关，
                         // 留给 stopServer/拔出/release 统一回收——在此之前 UI 显示
                         // 与 native 实际不一致，不做主动自愈
@@ -336,7 +360,18 @@ class UsbService : Service() {
                 throw t
             } catch (t: Throwable) {
                 Log.e(TAG, "bindDevice failed unexpectedly: ${device.deviceName}", t)
-                DeviceBindResult.Failure.UnknownError
+                // registered 已置位说明 native 绑定与设备表登记都已完成，失败的
+                // 只是后续的 state 发布（OOM 级）——真相是"绑上了"，谎报失败会让
+                // 用户重试时收到 DeviceInUse 更困惑；按真相返回 Success，UI 状态
+                // 由 stopServer/拔出/release 的回收链最终对齐。不回滚 native 绑定：
+                // 触发本分支的故障下回滚同样可能失败，多一条路径换不来确定性，
+                // 保持登记交给回收链是单一处理路径
+                val boundBusid = if (registered) activeDevices[device.deviceName]?.busid else null
+                if (boundBusid != null) {
+                    DeviceBindResult.Success(boundBusid)
+                } else {
+                    DeviceBindResult.Failure.UnknownError
+                }
             } finally {
                 if (!registered) {
                     // close 兜异常：释放失败只记日志——让它从 finally 抛出会
@@ -349,17 +384,28 @@ class UsbService : Service() {
     }
 
     suspend fun unbindDevice(deviceName: String): DeviceUnbindResult {
+        // 同 startServer/bindDevice：销毁开始后拒绝（见 destroying 声明处）——
+        // 清理线程会把全部设备连根清理，此时的解绑只是重复操作；按幂等成功
+        // 上报，与 DeviceNotFound 分支同一语义：目标（连接关、状态清）终将达成
+        if (destroying) {
+            return DeviceUnbindResult.Success
+        }
         // 同 bindDevice：挂 serviceNativeContext，cleanup 不会被调用方取消打断
         return withContext(serviceNativeContext) {
+            // 复查销毁标志：入口检查与本块开始之间主线程可能已置位（同 bindDevice）
+            if (destroying) {
+                return@withContext DeviceUnbindResult.Success
+            }
             val info = activeDevices[deviceName]
                 ?: return@withContext DeviceUnbindResult.Failure.DeviceNotFound
 
             // native 侧已无此设备（如已被拔出清理）时 Kotlin 侧连接和状态同样要清，
             // 否则连接泄漏、UI 一直显示已绑定
             fun cleanup() {
-                // close 兜异常：单次 close 失败不能阻止状态更新，否则 UI 永久
-                // 显示"已绑定"而 native 侧已解绑（closeAllDevices 同款处理）
-                runCatching { activeDevices.remove(deviceName)?.connection?.close() }
+                // 先摘登记再关连接：close 出任何问题都不影响摘除与状态更新，
+                // 否则 UI 永久显示"已绑定"而 native 侧已解绑（closeAllDevices 同款处理）
+                val removed = activeDevices.remove(deviceName)
+                runCatching { removed?.connection?.close() }
                     .onFailure { e -> Log.w(TAG, "close device failed", e) }
                 _state.update { it.copy(boundDevices = it.boundDevices - deviceName) }
             }
@@ -373,12 +419,14 @@ class UsbService : Service() {
                         Log.i(TAG, "Device unbound: $deviceName")
                         result
                     }
-                    // 服务器已不在时设备同样视为已消失，Kotlin 侧连接和状态照清
+                    // 服务器已不在/设备已消失：Kotlin 侧连接和状态照清，并按幂等
+                    // 成功上报——解绑目标（连接关、状态清）已达成，报 Failure 会让
+                    // UI 提示"解绑失败"而实际已清，自相矛盾
                     DeviceUnbindResult.Failure.DeviceNotFound,
                     DeviceUnbindResult.Failure.ServerNotRunning -> {
                         cleanup()
                         Log.w(TAG, "Device already gone in native: $deviceName")
-                        result
+                        DeviceUnbindResult.Success
                     }
                     DeviceUnbindResult.Failure.DeviceInUse -> result
                     else -> {
@@ -387,7 +435,7 @@ class UsbService : Service() {
                     }
                 }
             } catch (t: CancellationException) {
-                // 结构化并发规范：取消必须向上传播，不能转成普通失败结果
+                // 同 bindDevice：取消必须向上传播，不能转成普通失败结果
                 throw t
             } catch (t: Throwable) {
                 Log.e(TAG, "unbindDevice failed unexpectedly: $deviceName", t)
@@ -419,7 +467,7 @@ class UsbService : Service() {
             try {
                 UsbIpNative.notifyDeviceRemoved(info.busid)
             } catch (t: CancellationException) {
-                // 结构化并发规范：取消必须向上传播，不能转成普通失败结果
+                // 同 bindDevice：取消必须向上传播，不能转成普通失败结果
                 throw t
             } catch (t: Throwable) {
                 Log.e(TAG, "notifyDeviceRemoved failed: ${usbDevice.deviceName}", t)
@@ -446,6 +494,10 @@ class UsbService : Service() {
     // 之后 UI 会一直显示已绑定而连接早已关闭（两者经 _state 是同一真相源）。
     // 逐个 close 兜异常：单个失败不应中断其余设备的关闭与状态清理
     private fun closeAllDevices() {
+        // 防误用断言：拦最现实的误调路径——主线程（serviceScope 是 Main.immediate，
+        // 在里面直接调用会命中）。完整的"必须持有 nativeDispatcher 许可"校验
+        // 需要暴露调度器，不为假设场景引入
+        check(Looper.myLooper() != Looper.getMainLooper()) { "closeAllDevices must not run on the main thread" }
         activeDevices.values.forEach {
             runCatching { it.connection.close() }
                 .onFailure { e -> Log.w(TAG, "close device failed", e) }

@@ -1,5 +1,6 @@
 package com.yunsmall.usbipdcpp.ui
 
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -77,20 +78,12 @@ fun ColumnScope.LogSection(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 } else {
-                    LaunchedEffect(logVersion, slackPx) {
-                        // 新文本的测量/布局晚于本 effect 启动：等一帧再读写 maxValue，
-                        // 否则判定与滚动目标都基于旧布局
-                        withFrameNanos { }
-                        // 用户往上翻看历史时不要打断：只在贴近底部时跟随最新日志。
-                        // 宽容度见 AUTO_SCROLL_SLACK_DP 的说明；slackPx 进 key 让
-                        // 字体缩放变化后按新值重新判断——判定在本 effect 内做，
-                        // 缩放重启 effect 不会把远离底部的历史读者拉回底部
-                        if (scrollState.value >= scrollState.maxValue - slackPx) {
-                            scrollState.animateScrollTo(scrollState.maxValue)
-                        }
-                    }
+                    AutoScrollEffect(scrollState, logVersion, slackPx)
 
                     Text(
+                        // 拼接只在日志内容变化时发生（参数不变时重组被 Compose 跳过，
+                        // 滚动不触发重组），500 条上限下开销微秒级；加缓存或换
+                        // LazyColumn 的复杂度换不来收益
                         text = logMessages.joinToString("\n"),
                         style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier
@@ -108,13 +101,7 @@ fun FullLogDialog(logMessages: List<String>, logVersion: Long, onDismiss: () -> 
     val scrollState = rememberScrollState()
     val slackPx = with(LocalDensity.current) { AUTO_SCROLL_SLACK_DP.dp.roundToPx() }
 
-    LaunchedEffect(logVersion, slackPx) {
-        // 同 LogSection：先等一帧布局，贴底宽容度见 AUTO_SCROLL_SLACK_DP
-        withFrameNanos { }
-        if (scrollState.value >= scrollState.maxValue - slackPx) {
-            scrollState.animateScrollTo(scrollState.maxValue)
-        }
-    }
+    AutoScrollEffect(scrollState, logVersion, slackPx)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -141,4 +128,22 @@ fun FullLogDialog(logMessages: List<String>, logVersion: Long, onDismiss: () -> 
             }
         }
     )
+}
+
+// 自动滚动的共用 effect（LogSection 与 FullLogDialog）：判定与滚动都放进
+// key 驱动的 effect，slackPx 由调用方按自身 LocalDensity 计算传入
+@Composable
+private fun AutoScrollEffect(scrollState: ScrollState, logVersion: Long, slackPx: Int) {
+    LaunchedEffect(logVersion, slackPx) {
+        // 新文本的测量/布局晚于本 effect 启动：等一帧再读写 maxValue，
+        // 否则判定与滚动目标都基于旧布局
+        withFrameNanos { }
+        // 用户往上翻看历史时不要打断：只在贴近底部时跟随最新日志。
+        // 宽容度见 AUTO_SCROLL_SLACK_DP 的说明；slackPx 进 key 让
+        // 字体缩放变化后按新值重新判断——判定在本 effect 内做，
+        // 缩放重启 effect 不会把远离底部的历史读者拉回底部
+        if (scrollState.value >= scrollState.maxValue - slackPx) {
+            scrollState.animateScrollTo(scrollState.maxValue)
+        }
+    }
 }

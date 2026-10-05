@@ -6,6 +6,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
@@ -17,10 +18,10 @@ import com.yunsmall.usbipdcpp.R
 @Composable
 fun ColumnScope.DeviceListSection(
     devices: Map<String, UsbDevice>,
-    boundDevices: Set<String>,
+    // deviceName -> busid：判绑定与取 busid 用同一份数据，不拆两条参数线
+    boundDevices: Map<String, String>,
     busyDevices: Set<String>,
     serverRunning: Boolean,
-    getBusid: (String) -> String?,
     onBindDevice: (UsbDevice) -> Unit,
     onUnbindDevice: (UsbDevice) -> Unit,
     onRefresh: () -> Unit
@@ -33,6 +34,9 @@ fun ColumnScope.DeviceListSection(
             .weight(1.5f, fill = false)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
+            // entries 列表按 devices 缓存：重组（如 busyDevices 进度动画驱动的帧）
+            // 不重造；放条件外与 LogSection 的 scrollState 同理，分支切换不丢缓存
+            val deviceEntries = remember(devices) { devices.entries.toList() }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -64,11 +68,11 @@ fun ColumnScope.DeviceListSection(
                         .weight(1f),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    items(devices.entries.toList(), key = { it.value.deviceName }) { entry ->
+                    items(deviceEntries, key = { it.value.deviceName }) { entry ->
                         val device = entry.value
-                        val isBound = boundDevices.contains(device.deviceName)
+                        val isBound = boundDevices.containsKey(device.deviceName)
 
-                        val busid = getBusid(device.deviceName)
+                        val busid = boundDevices[device.deviceName]
                         DeviceItem(
                             device = device,
                             isBound = isBound,

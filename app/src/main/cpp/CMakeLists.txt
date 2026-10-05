@@ -3,10 +3,18 @@ cmake_minimum_required(VERSION 3.22.1)
 # set(CMAKE_ANDROID_RTTI ON CACHE)
 
 set(VCPKG_ROOT $ENV{VCPKG_ROOT})
+# 变量缺失时点名报错，否则工具链路径退化成 "/scripts/..."，配置期的报错看不懂
+if ("${VCPKG_ROOT}" STREQUAL "")
+    message(FATAL_ERROR "环境变量 VCPKG_ROOT 未设置：依赖与工具链均经 vcpkg 提供")
+endif ()
 string(REPLACE "\\" "/" VCPKG_ROOT "${VCPKG_ROOT}")
 set(CMAKE_TOOLCHAIN_FILE "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
 
 set(ANDROID_NDK_HOME $ENV{ANDROID_NDK_HOME})
+# 同上：缺失时先给出点名报错
+if ("${ANDROID_NDK_HOME}" STREQUAL "")
+    message(FATAL_ERROR "环境变量 ANDROID_NDK_HOME 未设置：vcpkg 链加载的 Android 工具链文件在其下")
+endif ()
 string(REPLACE "\\" "/" ANDROID_NDK_HOME "${ANDROID_NDK_HOME}")
 set(VCPKG_CHAINLOAD_TOOLCHAIN_FILE "${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake")
 

@@ -73,6 +73,17 @@ class UsbPermissionManager(
         onPermissionResult = listener
     }
 
+    // 权限结果的唯一投递点：监听器实现来自组合层，而两条投递路径的调用栈
+    // 都在边界上——onReceive 是系统回调，已有权限的同步交付在 Compose 事件
+    // 栈，监听器的异常穿过任一边界都会崩掉进程，在此兜住并记录
+    private fun deliverResult(device: UsbDevice, granted: Boolean) {
+        try {
+            onPermissionResult?.invoke(device, granted)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Permission result listener threw", t)
+        }
+    }
+
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
@@ -86,6 +97,8 @@ class UsbPermissionManager(
 
                     val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
 
+                    // 系统权限结果必带 EXTRA_DEVICE；缺失属非常规实现，忽略即可——
+                    // 该设备名的 pending 登记由超时窗口放行重试
                     device?.let { usbDevice ->
                         Log.d(TAG, "USB permission result for ${usbDevice.deviceName}: $granted")
                         // 锁内只改登记表，锁外交付结果：监听器可能再次发起权限
@@ -96,8 +109,12 @@ class UsbPermissionManager(
                         // 无条件交付：请求可能跨 Activity 重建（对话框期间旋转），
                         // 新实例的登记表是空的，不能以"有登记"为交付前提；设备
                         // 是否仍在由监听器侧核实。无监听器（UI 恰在重建间隙）时
-                        // 结果丢弃，用户重新点击即可
-                        onPermissionResult?.invoke(usbDevice, granted)
+                        // 结果丢弃，用户重新点击即可。
+                        // 已知代价：超时接管后旧对话框若其实没死，新旧两个结果
+                        // 都会交付（第二次以 DeviceInUse 被拒）——能区分新旧请求
+                        // 的方案（如请求令牌）都要求新实例识别旧请求，令牌却随旧
+                        // 实例销毁，与跨重建交付冲突，取交付优先
+                        deliverResult(usbDevice, granted)
                     }
                 }
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
@@ -135,6 +152,9 @@ class UsbPermissionManager(
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // RECEIVER_NOT_EXPORTED 只拦"其他应用"发来的广播：系统（system uid）
+            // 的插拔广播不受影响，权限结果广播经 PendingIntent 以本应用身份投递
+            //（AMS 对同 uid 放行），两条来源都照收；显式导出反而给伪造广播留口
             context.registerReceiver(usbReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
             context.registerReceiver(usbReceiver, filter)
@@ -180,9 +200,8 @@ class UsbPermissionManager(
             // 已有权限：同步交付，调用方不必感知快慢两条路径。监听器为 null
             //（UI 恰在重建间隙）时交付被丢弃——调用方都在组合内调用本方法，
             // 监听器必然已装；保留一行日志便于异常时序下排查
-            val listener = onPermissionResult
-            if (listener != null) {
-                listener.invoke(device, true)
+            if (onPermissionResult != null) {
+                deliverResult(device, true)
             } else {
                 Log.w(TAG, "Permission already granted but no listener to deliver to")
             }
@@ -199,6 +218,11 @@ class UsbPermissionManager(
             val submittedAt = pendingDevices[device.deviceName]
             if (submittedAt != null && now - submittedAt < PERMISSION_PENDING_TIMEOUT_MS) {
                 return false
+            }
+            if (submittedAt != null) {
+                // 能到这里说明登记已超时：记一行便于排查"为何用户看到两个
+                // 权限弹窗/结果错位"——前一次请求被判定为结果已丢失并接管
+                Log.w(TAG, "Stale permission request taken over: ${device.deviceName}")
             }
             pendingDevices[device.deviceName] = now
         }

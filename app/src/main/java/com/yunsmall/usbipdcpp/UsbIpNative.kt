@@ -3,11 +3,17 @@ package com.yunsmall.usbipdcpp
 import android.os.Looper
 import android.util.Log
 import androidx.annotation.WorkerThread
+import kotlin.coroutines.CoroutineContext
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 
+// 本文件三条纪律（细节与理由见各处注释）：
+// 1. 所有 JNI 调用经 jniContext：native 侧串行 + 不可取消
+// 2. 库加载守卫（libraryLoaded）只收在公开方法里，*Impl 不自行判断
+// 3. 公开 suspend 方法自己切到 jniContext，调用方不必记得切
 object UsbIpNative {
     private const val TAG = "UsbIpNative"
 
@@ -39,7 +45,37 @@ object UsbIpNative {
     // 相等比较）时直接把 block 内联执行，连调度队列都不进，不依赖 LimitedDispatcher
     // 的队列行为。UsbService.serviceNativeContext 直接复用下方的 jniContext 实例：
     // 实例相等不靠"两处都记得写上 nativeDispatcher"这种约定维持
-    private val nativeDispatcher = Dispatchers.IO.limitedParallelism(1)
+    private val nativeDispatcher = NativeTaskDispatcher(Dispatchers.IO.limitedParallelism(1))
+
+    // 给限流 dispatcher 包一层"任务执行期线程标记"：runOnNativeThread 的误用检查
+    //（在 native 任务内阻塞等待自己）需要知道"当前线程是否正跑在 native 任务里"，
+    // 而限流器的许可持有状态不可观测，这个标记是唯一的运行时信号。包装类保持
+    // 单实例参与协程上下文：withContext 的内联 fast path 按 interceptor 实例
+    // 相等判定，jniContext 与其复用者（UsbService.serviceNativeContext）共用
+    // 同一个包装实例，嵌套派发的内联行为不变
+    private class NativeTaskDispatcher(private val delegate: CoroutineDispatcher) : CoroutineDispatcher() {
+        private val inNativeTask = ThreadLocal<Boolean>()
+
+        // 当前线程是否正在执行 native 任务：runOnNativeThread 的误用检查读它
+        val isInNativeTask: Boolean
+            get() = inNativeTask.get() == true
+
+        override fun dispatch(context: CoroutineContext, block: Runnable) {
+            // 标记由任务实际执行的线程设置（dispatch 的调用线程与 worker 线程
+            // 可能不同）；remove 而非 set(false)：池线程长活，不留残值
+            delegate.dispatch(context, Runnable {
+                inNativeTask.set(true)
+                try {
+                    block.run()
+                } finally {
+                    inNativeTask.remove()
+                }
+            })
+        }
+
+        override fun isDispatchNeeded(context: CoroutineContext): Boolean =
+            delegate.isDispatchNeeded(context)
+    }
 
     // 所有 JNI 调用都在这个上下文执行：
     // - nativeDispatcher 保证串行（LibusbServer 无锁）
@@ -59,7 +95,7 @@ object UsbIpNative {
     private external fun bindUsbDeviceImpl(fd: Int, vendorId: Int, productId: Int, outBusid: Array<String?>): Int
     private external fun unbindUsbDeviceImpl(fd: Int): Int
     private external fun notifyDeviceRemovedImpl(busid: String)
-    private external fun startServerImpl(port: Int): Boolean
+    private external fun startServerImpl(port: Int): Int
     private external fun stopServerImpl()
     private external fun releaseImpl()
 
@@ -115,13 +151,18 @@ object UsbIpNative {
                     // SetObjectArrayElement）时 native 会自行回滚并返回 UNKNOWN_ERROR，
                     // 走的是 else 分支，能进到这里说明 native 假报了成功，不是重复解绑。
                     // 调用方没有登记、稍后只会关连接，不主动解绑的话 native 侧留下谁也
-                    // 解不了的孤儿。走公开方法而非 *Impl：库加载守卫统一收口在公开层；
-                    // 同 dispatcher 的 withContext 原地执行，不会嵌套等待
-                    val rollback = unbindUsbDevice(fd)
-                    // simpleName 即结果的子类名（Success/DeviceNotFound/...）：回滚
-                    // 失败（如 DeviceNotFound）时 native 侧成孤儿且无人能解——busid
-                    // 本就不可得，只能等 release/重启服务器整体回收
-                    Log.e(TAG, "bind returned SUCCESS but busid is null, fd=$fd, rolled back by fd: ${rollback::class.simpleName}")
+                    // 解不了的孤儿。走 InContext 版本而非公开方法：已持有 jniContext
+                    // 许可，再经公开方法的 withContext 会排队等待自己（不依赖内联
+                    // fast path）；库加载守卫在公开层，本调用已在外层守卫之后
+                    val rollback = unbindUsbDeviceInContext(fd)
+                    // 分两路记，避免把"没得回滚"（DeviceNotFound 等）与成功混在同一
+                    // 措辞里：回滚失败时 native 侧成孤儿且无人能解——busid 本就不可得，
+                    // 只能等 release/重启服务器整体回收
+                    if (rollback is DeviceUnbindResult.Success) {
+                        Log.e(TAG, "bind returned SUCCESS but busid is null, rolled back by fd, fd=$fd")
+                    } else {
+                        Log.e(TAG, "bind returned SUCCESS but busid is null, rollback by fd failed: ${rollback::class.simpleName}, fd=$fd")
+                    }
                     DeviceBindResult.Failure.UnknownError
                 }
             } else {
@@ -132,16 +173,22 @@ object UsbIpNative {
 
     suspend fun unbindUsbDevice(fd: Int): DeviceUnbindResult {
         if (!libraryLoaded) return DeviceUnbindResult.Failure.UnknownError
-        return withContext(jniContext) {
-            when (val code = unbindUsbDeviceImpl(fd)) {
-                ErrorCode.SUCCESS -> DeviceUnbindResult.Success
-                ErrorCode.DEVICE_NOT_FOUND -> DeviceUnbindResult.Failure.DeviceNotFound
-                ErrorCode.DEVICE_IN_USE -> DeviceUnbindResult.Failure.DeviceInUse
-                ErrorCode.SERVER_NOT_RUNNING -> DeviceUnbindResult.Failure.ServerNotRunning
-                else -> {
-                    Log.e(TAG, "Unknown unbind error: $code")
-                    DeviceUnbindResult.Failure.UnknownError
-                }
+        return withContext(jniContext) { unbindUsbDeviceInContext(fd) }
+    }
+
+    // 不带 withContext 的版本：供已持有 jniContext 许可的调用方使用（bindUsbDevice
+    // 的契约违约回滚）。在许可内再经公开方法嵌套 withContext 会排队等待自己——
+    // 这里不依赖"同 dispatcher 内联 fast path"这类实现细节。库加载守卫由公开
+    // 方法统一收口，调用方必须保证已过守卫且已在 jniContext 内
+    private fun unbindUsbDeviceInContext(fd: Int): DeviceUnbindResult {
+        return when (val code = unbindUsbDeviceImpl(fd)) {
+            ErrorCode.SUCCESS -> DeviceUnbindResult.Success
+            ErrorCode.DEVICE_NOT_FOUND -> DeviceUnbindResult.Failure.DeviceNotFound
+            ErrorCode.DEVICE_IN_USE -> DeviceUnbindResult.Failure.DeviceInUse
+            ErrorCode.SERVER_NOT_RUNNING -> DeviceUnbindResult.Failure.ServerNotRunning
+            else -> {
+                Log.e(TAG, "Unknown unbind error: $code")
+                DeviceUnbindResult.Failure.UnknownError
             }
         }
     }
@@ -156,8 +203,13 @@ object UsbIpNative {
         withContext(jniContext) { notifyDeviceRemovedImpl(busid) }
     }
 
-    suspend fun startServer(port: Int): Boolean {
-        if (!libraryLoaded) return false
+    /**
+     * 启动服务器。返回实际监听端口：成功启动或已在运行时都是当前真实端口
+     *（已在运行时可能是先前启动的原端口，不是本次入参），失败返回 -1——
+     * 调用方回填 state 的 port 必须用它，不能用入参推断
+     */
+    suspend fun startServer(port: Int): Int {
+        if (!libraryLoaded) return -1
         return withContext(jniContext) { startServerImpl(port) }
     }
 
@@ -178,6 +230,8 @@ object UsbIpNative {
      * 当前线程若正持有该限流 dispatcher 的唯一许可，阻塞等待自己的许可会自死锁
      *（与 withContext 的内联 fast path 不同，那是同协程切换，这里是阻塞整个线程）。
      * 现有唯一调用点是 onDestroy 的专用清理线程（裸线程，不持有许可）。
+     * 两种误用都能在运行时拦下：主线程检查 + native 任务内线程标记（见
+     * nativeDispatcher 声明处的包装层）。
      * internal：仅供本应用模块内的服务层使用，不作为公开 API
      */
     @WorkerThread
@@ -185,6 +239,9 @@ object UsbIpNative {
         // 防误用断言（全构建生效）：主线程调用会让 runBlocking 卡到 native 完成，
         // 断言让它立刻失败而非静默卡顿到 ANR
         check(Looper.myLooper() != Looper.getMainLooper()) { "runOnNativeThread must not be called on the main thread" }
+        // 同线程已在 native 任务内时（持有唯一许可）：runBlocking 阻塞本线程、
+        // 再取许可必然排队等待自己（静默死锁，无日志难排查），入口处直接失败
+        check(!nativeDispatcher.isInNativeTask) { "runOnNativeThread must not be called from inside a native task" }
         runBlocking {
             // 用 jniContext 而非裸 dispatcher：与其余 JNI 调用同一纪律
             //（串行 + 不可取消），换调用场景时不会踩"被取消留下半截状态"的坑

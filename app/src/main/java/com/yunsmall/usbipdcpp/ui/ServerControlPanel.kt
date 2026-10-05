@@ -35,7 +35,7 @@ fun ServerControlPanel(
             ) {
                 OutlinedTextField(
                     value = portText,
-                    onValueChange = { onPortChange(it.filter { c -> c.isDigit() }) },
+                    onValueChange = { onPortChange(it.filter(Char::isDigit)) },
                     label = { Text(stringResource(R.string.port)) },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     modifier = Modifier.width(100.dp),

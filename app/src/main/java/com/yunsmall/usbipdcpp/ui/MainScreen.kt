@@ -5,9 +5,9 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -36,6 +36,8 @@ import com.yunsmall.usbipdcpp.UsbPermissionManager
 import com.yunsmall.usbipdcpp.UsbService
 import com.yunsmall.usbipdcpp.util.getDeviceIpAddress
 import com.yunsmall.usbipdcpp.util.isCameraDevice
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
@@ -47,10 +49,6 @@ private const val TAG = "MainActivity"
 // 本文件命名约定：deviceName 一律指 UsbDevice.deviceName（系统设备名，各表的
 // 键）；给用户显示的名字（productName）统一叫 displayName
 
-// 日志区只保留最近若干条：debug 级日志量大且服务长期运行，不设上限的话
-// 每次追加的列表复制和展示时的整段拼接会越来越重
-private const val MAX_LOG_LINES = 500
-
 // 相机权限 pending 的陈旧判定阈值：进程被杀后系统对话框可能已消失、授权结果
 // 永远不会投递，saved state 恢复出的 pending 收不到任何复位路径、会一直挡住
 // 相机设备的绑定；超过该时限由用户下一次点击触发接管（见 onBindDevice）
@@ -59,7 +57,7 @@ private const val CAMERA_PENDING_TIMEOUT_MS = 60_000L
 // 用 DateTimeFormatter 而非 SimpleDateFormat：后者非线程安全，虽然 addLog 目前
 // 只在主线程调用（native 回调经 mainHandler.post、手动刷新在主线程），但不必给
 // 调用方留这个隐性前提；每行日志一次格式化的热路径上同样复用实例
-private val logTimeFormat = java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss")
+private val logTimeFormat = DateTimeFormatter.ofPattern("HH:mm:ss")
 
 fun setLanguage(language: String) {
     val localeList = if (language == "system") {
@@ -83,15 +81,12 @@ fun MainScreen(
     var portText by rememberSaveable { mutableStateOf(UsbService.DEFAULT_PORT.toString()) }
     // 日志不用 rememberSaveable：旋转丢日志无害（native 日志仍在持续产生），
     // 把最多 500 条字符串序列化进 Bundle 是纯开销
-    var logMessages by remember { mutableStateOf(listOf<String>()) }
-    // 自动滚动的 effect key：列表封顶在 MAX_LOG_LINES 后 size 恒定不变，
-    // 同秒重复消息的内容也可能完全相等（列表比较同样失效）——用单调递增的
-    // 版本号，任何一条新日志都必然触发
-    var logVersion by remember { mutableStateOf(0L) }
+    val logBuffer = remember { LogBuffer() }
     var devices by remember { mutableStateOf(mapOf<String, UsbDevice>()) }
     var showFullLog by remember { mutableStateOf(false) }
-    var showLanguageMenu by remember { mutableStateOf(false) }
     var showAbout by remember { mutableStateOf(false) }
+    // 在途设备集合（Set 而非单值：允许多台设备同时发起绑定/解绑，逐设备
+    // 显示进度并禁用按钮；改成单值会破坏并发语义）
     var busyDevices by remember { mutableStateOf(setOf<String>()) }
     // 存设备名而非 UsbDevice 对象（非 Parcelable 无法存 SavedState）：
     // 权限对话框期间系统回收 Activity（如"不保留活动"）后重建时，
@@ -115,7 +110,7 @@ fun MainScreen(
     // 调用的永远是最新组合的 performBind——两条路都读不到过期的 nativeReady
     val serviceState by (usbService?.state ?: emptyServiceState).collectAsState(UsbService.UiState())
     val serverRunning = serviceState.serverRunning
-    val boundDevices = serviceState.boundDevices.keys
+    val boundDevices = serviceState.boundDevices
 
     // 启动成功后回填实际使用的端口；只在运行中回填，否则旋转重建时会把用户
     // 已经输入但还没提交的端口覆盖回默认值（rememberSaveable 就白搭了）
@@ -217,12 +212,11 @@ fun MainScreen(
         }
     }
 
-    // logMessages 是 remember 的 state 委托：闭包捕获的是委托而非值快照，
+    // logBuffer 是 remember 的实例：闭包捕获的是实例引用而非值快照，
     // DisposableEffect 里首次组合捕获的本函数实例读写的一直是当前状态，
     // 无需 rememberUpdatedState 转发
     fun addLog(message: String) {
-        logMessages = (logMessages + "[${java.time.LocalTime.now().format(logTimeFormat)}] $message").takeLast(MAX_LOG_LINES)
-        logVersion++
+        logBuffer.append("[${LocalTime.now().format(logTimeFormat)}] $message")
     }
 
     fun refreshDevices() {
@@ -243,33 +237,8 @@ fun MainScreen(
         }
     }
 
-    // 设置native日志回调
-    DisposableEffect(Unit) {
-        // onLog 由 native 日志线程回调，直接更新 Compose 状态会跨线程写，
-        // 切到主线程再执行
-        val mainHandler = Handler(Looper.getMainLooper())
-        val callback = object : LogCallback {
-            override fun onLog(level: Int, message: String) {
-                // native pattern 的输出末尾一般无空白，trim 是防御性清理；
-                // onDispose 后队列里可能残留少量已 post 的任务：它们只写已销毁
-                // 组合的状态（无观察者、不触发重组），无需追踪撤销
-                mainHandler.post { addLog(message.trim()) }
-            }
-        }
-        UsbIpNative.setLogCallback(callback)
-        onDispose {
-            // 必须清回调：旋转重建时新 setLogCallback 会替换旧引用（无需清理），
-            // 但应用退后台（Activity 销毁、不再有新回调）时不清的话，JNI 的
-            // 全局引用会一直持有旧 Activity，导致泄漏。
-            // 旋转时旧实例的销毁必然先于新实例创建（系统重建顺序固定），此处
-            // 清除不会误清新回调；分屏双开等反向时序下最坏只是回调被清空（日志
-            // 停止刷新，旋转/重进即恢复），无正确性影响，不值得加清理令牌。
-            // 清完回调再清队列：队列里已 post 的残留日志任务只会写已销毁的
-            // 组合状态
-            UsbIpNative.setLogCallback(null)
-            mainHandler.removeCallbacksAndMessages(null)
-        }
-    }
+    // 设置native日志回调（注册/清除与主线程转发见 NativeLogBridge）
+    NativeLogBridge { addLog(it) }
 
     // 首次组合刷新一次设备列表；之后由插拔广播与手动刷新按钮驱动
     LaunchedEffect(Unit) { refreshDevices() }
@@ -326,43 +295,7 @@ fun MainScreen(
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
-        topBar = {
-            TopAppBar(
-                title = { Text(stringResource(R.string.app_title)) },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer
-                ),
-                actions = {
-                    TextButton(onClick = { showAbout = true }) {
-                        Text(stringResource(R.string.about))
-                    }
-                    Box {
-                        TextButton(onClick = { showLanguageMenu = true }) {
-                            Text(stringResource(R.string.language))
-                        }
-                        DropdownMenu(
-                            expanded = showLanguageMenu,
-                            onDismissRequest = { showLanguageMenu = false }
-                        ) {
-                            DropdownMenuItem(
-                                text = { Text(stringResource(R.string.language_en)) },
-                                onClick = {
-                                    setLanguage("en")
-                                    showLanguageMenu = false
-                                }
-                            )
-                            DropdownMenuItem(
-                                text = { Text(stringResource(R.string.language_zh)) },
-                                onClick = {
-                                    setLanguage("zh")
-                                    showLanguageMenu = false
-                                }
-                            )
-                        }
-                    }
-                }
-            )
-        }
+        topBar = { MainTopBar(onAboutClick = { showAbout = true }) }
     ) { innerPadding ->
         Column(
             modifier = Modifier
@@ -385,38 +318,38 @@ fun MainScreen(
                         Toast.makeText(context, context.getString(R.string.invalid_port), Toast.LENGTH_SHORT).show()
                         return@ServerControlPanel
                     }
-                    val service = usbService
-                    if (service == null) {
-                        Toast.makeText(context, context.getString(R.string.service_not_ready), Toast.LENGTH_SHORT).show()
-                        return@ServerControlPanel
-                    }
-                    // native 初始化失败时无法启动服务器，明确提示
-                    if (!serviceState.nativeReady) {
-                        Toast.makeText(context, context.getString(R.string.native_init_failed), Toast.LENGTH_SHORT).show()
-                        return@ServerControlPanel
-                    }
+                    // 服务/native 就绪校验统一走 requireReadyService：与绑定、
+                    // 解绑路径同一个入口（校验规则与提示文案不各改各的），
+                    // 服务引用经 currentUsbService 读最新绑定，不再单独取快照
+                    val service = requireReadyService() ?: return@ServerControlPanel
                     isStarting = true
                     scope.launch {
-                        // 启动结果由 Service 的 StateFlow 反映，成功后 UI 自动切到运行态；
-                        // 失败（如端口被占用）状态不变，必须显式提示，否则用户只看到按钮弹回
-                        val started = service.startServer(port)
-                        isStarting = false
-                        if (!started) {
-                            Toast.makeText(context, context.getString(R.string.start_failed), Toast.LENGTH_SHORT).show()
+                        // finally 复位：协程被取消（组合销毁）时不残留"启动中"——
+                        // 重建虽会重新初始化状态，但结构上不留半截
+                        try {
+                            // 启动结果由 Service 的 StateFlow 反映，成功后 UI 自动切到运行态；
+                            // 失败（如端口被占用）状态不变，必须显式提示，否则用户只看到按钮弹回
+                            val started = service.startServer(port)
+                            if (!started) {
+                                Toast.makeText(context, context.getString(R.string.start_failed), Toast.LENGTH_SHORT).show()
+                            }
+                        } finally {
+                            isStarting = false
                         }
                     }
                 },
                 onStop = {
-                    val service = usbService
-                    if (service == null) {
-                        Toast.makeText(context, context.getString(R.string.service_not_ready), Toast.LENGTH_SHORT).show()
-                        return@ServerControlPanel
-                    }
+                    // 同 onStart：就绪校验走唯一入口 requireReadyService
+                    val service = requireReadyService() ?: return@ServerControlPanel
                     isStopping = true
                     scope.launch {
-                        // 停止后 serverRunning/绑定列表由 Service 的 StateFlow 清空
-                        service.stopServer()
-                        isStopping = false
+                        try {
+                            // 停止后 serverRunning/绑定列表由 Service 的 StateFlow 清空
+                            service.stopServer()
+                        } finally {
+                            // 同 onStart：取消（组合销毁）时不残留"停止中"
+                            isStopping = false
+                        }
                     }
                 }
             )
@@ -435,7 +368,6 @@ fun MainScreen(
                 boundDevices = boundDevices,
                 busyDevices = busyDevices,
                 serverRunning = serverRunning,
-                getBusid = { serviceState.boundDevices[it] },
                 onBindDevice = { device ->
                     if (!serverRunning) {
                         Toast.makeText(context, context.getString(R.string.please_start_server), Toast.LENGTH_SHORT).show()
@@ -478,11 +410,8 @@ fun MainScreen(
                     }
                 },
                 onUnbindDevice = { device ->
-                    val service = usbService
-                    if (service == null) {
-                        Toast.makeText(context, context.getString(R.string.service_not_ready), Toast.LENGTH_SHORT).show()
-                        return@DeviceListSection
-                    }
+                    // 同 onStart：就绪校验走唯一入口 requireReadyService
+                    val service = requireReadyService() ?: return@DeviceListSection
                     val displayName = device.productName?.takeIf { it.isNotEmpty() }
                         ?: context.getString(R.string.unknown_device)
                     scope.launch {
@@ -507,13 +436,13 @@ fun MainScreen(
             )
 
             LogSection(
-                logMessages = logMessages,
-                logVersion = logVersion,
-                onClear = { logMessages = emptyList() },
+                logMessages = logBuffer.messages,
+                logVersion = logBuffer.version,
+                onClear = { logBuffer.clear() },
                 onViewFullLog = { showFullLog = true },
                 onCopyLog = {
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    clipboard.setPrimaryClip(ClipData.newPlainText("Log", logMessages.joinToString("\n")))
+                    clipboard.setPrimaryClip(ClipData.newPlainText("Log", logBuffer.messages.joinToString("\n")))
                     Toast.makeText(context, context.getString(R.string.log_copied), Toast.LENGTH_SHORT).show()
                 }
             )
@@ -522,8 +451,8 @@ fun MainScreen(
 
     if (showFullLog) {
         FullLogDialog(
-            logMessages = logMessages,
-            logVersion = logVersion,
+            logMessages = logBuffer.messages,
+            logVersion = logBuffer.version,
             onDismiss = { showFullLog = false }
         )
     }
@@ -564,4 +493,81 @@ fun MainScreen(
             }
         )
     }
+}
+
+// native 日志回调的桥接：注册/清除与主线程转发都收在这里。addLog 经 lambda
+// 传入（闭包捕获 remember 的 logBuffer 实例）：DisposableEffect(Unit) 只在
+// 首次组合注册一次，捕获首次组合的 lambda 也无碍——其行为只依赖稳定的
+// logBuffer，不读取易变的组合快照
+@Composable
+private fun NativeLogBridge(addLog: (String) -> Unit) {
+    DisposableEffect(Unit) {
+        // onLog 由 native 日志线程回调，直接更新 Compose 状态会跨线程写，
+        // 切到主线程再执行
+        val mainHandler = Handler(Looper.getMainLooper())
+        val callback = object : LogCallback {
+            override fun onLog(level: Int, message: String) {
+                // native pattern 的输出末尾一般无空白，trim 是防御性清理；
+                // onDispose 后队列里可能残留少量已 post 的任务：它们只写已销毁
+                // 组合的状态（无观察者、不触发重组），无需追踪撤销
+                mainHandler.post { addLog(message.trim()) }
+            }
+        }
+        UsbIpNative.setLogCallback(callback)
+        onDispose {
+            // 必须清回调：旋转重建时新 setLogCallback 会替换旧引用（无需清理），
+            // 但应用退后台（Activity 销毁、不再有新回调）时不清的话，JNI 的
+            // 全局引用会一直持有旧 Activity，导致泄漏。
+            // 旋转时旧实例的销毁必然先于新实例创建（系统重建顺序固定），此处
+            // 清除不会误清新回调；分屏双开等反向时序下最坏只是回调被清空（日志
+            // 停止刷新，旋转/重进即恢复），无正确性影响，不值得加清理令牌。
+            // 清完回调再清队列：队列里已 post 的残留日志任务只会写已销毁的
+            // 组合状态
+            UsbIpNative.setLogCallback(null)
+            mainHandler.removeCallbacksAndMessages(null)
+        }
+    }
+}
+
+// 顶栏：标题、语言菜单与"关于"入口。语言菜单的展开状态局部化在这里，
+// 选择动作直接调文件级的 setLanguage；"关于"弹窗是 MainScreen 的状态，
+// 经回调传出
+@Composable
+private fun MainTopBar(onAboutClick: () -> Unit) {
+    var showLanguageMenu by remember { mutableStateOf(false) }
+    TopAppBar(
+        title = { Text(stringResource(R.string.app_title)) },
+        colors = TopAppBarDefaults.topAppBarColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer
+        ),
+        actions = {
+            TextButton(onClick = onAboutClick) {
+                Text(stringResource(R.string.about))
+            }
+            Box {
+                TextButton(onClick = { showLanguageMenu = true }) {
+                    Text(stringResource(R.string.language))
+                }
+                DropdownMenu(
+                    expanded = showLanguageMenu,
+                    onDismissRequest = { showLanguageMenu = false }
+                ) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.language_en)) },
+                        onClick = {
+                            setLanguage("en")
+                            showLanguageMenu = false
+                        }
+                    )
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.language_zh)) },
+                        onClick = {
+                            setLanguage("zh")
+                            showLanguageMenu = false
+                        }
+                    )
+                }
+            }
+        }
+    )
 }

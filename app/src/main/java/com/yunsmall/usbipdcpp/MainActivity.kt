@@ -35,7 +35,11 @@ class MainActivity : AppCompatActivity() {
     // Compose 观察的 Service 引用：ServiceConnection 回调都在主线程，直接写
     // State 让组合自动重组，不必再手工挂"状态变了"的回调并记住到处置空
     private val usbServiceHolder = mutableStateOf<UsbService?>(null)
-    private var serviceBound = false
+
+    // bindService 的返回值：true 表示绑定请求已受理（onServiceConnected 只是
+    // 随后异步到达），此后必须 unbindService——回调没来过也合法；
+    // false（系统拒绝绑定）时调用 unbindService 会抛 IllegalArgumentException
+    private var bindRequested = false
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -47,12 +51,10 @@ class MainActivity : AppCompatActivity() {
                 return
             }
             usbServiceHolder.value = binder.getService()
-            serviceBound = true
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             usbServiceHolder.value = null
-            serviceBound = false
         }
     }
 
@@ -65,7 +67,7 @@ class MainActivity : AppCompatActivity() {
         // 启动并绑定 Service
         val serviceIntent = Intent(this, UsbService::class.java)
         startForegroundService(serviceIntent)
-        bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
+        bindRequested = bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
 
         setContent {
             UsbipdcppTheme {
@@ -80,14 +82,15 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         permissionManager.unregisterReceiver()
-        // serviceBound 只在 onServiceConnected 里置 true：bindService 被系统拒绝
-        // 或回调还没到时绑定并不存在，此时调 unbindService 会抛
-        // IllegalArgumentException。回调未到就销毁的场景不会有 Service 泄漏——
-        // Activity context 的绑定跟随 ActivityRecord 生命周期由系统自动清理。
+        // bindRequested（bindService 的返回值）为 true 才解绑：它表示绑定已受理，
+        // onServiceConnected 到没到都算；false 表示未被受理，此时调用
+        // unbindService 会抛 IllegalArgumentException。
+        // 注：onServiceDisconnected（服务进程崩溃）不回撤此标志——绑定仍然有效，
+        // 系统会在服务重启后重新回调 onServiceConnected，解绑仍需执行。
         // usbServiceHolder 不用清：它与本 Activity 同生命周期，整条引用链一起回收
-        if (serviceBound) {
+        if (bindRequested) {
             unbindService(serviceConnection)
-            serviceBound = false
+            bindRequested = false
         }
         // 不停止 Service，让它继续运行
         // super 最后调用：销毁类回调的通行顺序是先清理自己持有的资源、再让基类
