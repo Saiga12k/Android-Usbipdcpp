@@ -25,10 +25,15 @@
         android:supportsRtl="true"
         android:localeConfig="@xml/locales_config"
         android:theme="@style/Theme.Usbipdcpp">
+        <!-- singleTask：USB 权限对话框点"允许"后，系统会向声明了 device_filter 的
+             本 Activity 投递 USB_DEVICE_ATTACHED intent；standard 模式会新建实例
+             压栈（观感像 Activity 重建、返回键要按两次），singleTask 让 intent 送到
+             既有实例（onNewIntent），全 app 保持单实例 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:label="@string/app_name"
+            android:launchMode="singleTask"
             android:theme="@style/Theme.Usbipdcpp"
             android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|screenLayout|uiMode">
             <intent-filter>

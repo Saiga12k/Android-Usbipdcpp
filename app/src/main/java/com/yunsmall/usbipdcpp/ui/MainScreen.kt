@@ -532,6 +532,9 @@ private fun NativeLogBridge(addLog: (String) -> Unit) {
 // 顶栏：标题、语言菜单与"关于"入口。语言菜单的展开状态局部化在这里，
 // 选择动作直接调文件级的 setLanguage；"关于"弹窗是 MainScreen 的状态，
 // 经回调传出
+// TopAppBar 是实验性 API，opt-in 必须挂在调用点所在的函数上——
+// MainScreen 上的那份 @OptIn 只覆盖它自己的函数体，管不到这里
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MainTopBar(onAboutClick: () -> Unit) {
     var showLanguageMenu by remember { mutableStateOf(false) }
