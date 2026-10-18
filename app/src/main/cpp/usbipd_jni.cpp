@@ -3,6 +3,7 @@
 #include <memory>
 #include <mutex>
 #include <cerrno>
+#include <string>
 #include <libusb-1.0/libusb.h>
 
 #include <spdlog/spdlog.h>
@@ -34,8 +35,8 @@ namespace ErrorCode {
 
 namespace {
 #ifdef USBIPDCPP_LIBUSB_DEBUG_LOGS
-    // Write directly to logcat: avoid JNI/UI work on libusb's transfer/event threads.
-    void LIBUSB_CALL libusb_logcat_callback(libusb_context*, libusb_log_level level, const char* message) {
+    // Keep verbose logs in logcat; forward only warnings/errors to the existing UI bridge.
+    void LIBUSB_CALL libusb_logcat_callback(libusb_context*, libusb_log_level level, const char* message) noexcept {
         const int saved_errno = errno;
         int priority;
         switch (level) {
@@ -46,6 +47,15 @@ namespace {
             default: return;
         }
         __android_log_write(priority, "UsbIpLibusb", message);
+        if (level == LIBUSB_LOG_LEVEL_ERROR || level == LIBUSB_LOG_LEVEL_WARNING) {
+            try {
+                jni_log::log_callback(level == LIBUSB_LOG_LEVEL_ERROR ? spdlog::level::err : spdlog::level::warn,
+                                      std::string("[libusb] ") + message);
+            } catch (...) {
+                // Exceptions must not cross libusb's C callback boundary.
+                __android_log_write(ANDROID_LOG_ERROR, "UsbIpLibusb", "Failed to forward libusb message to app log");
+            }
+        }
         errno = saved_errno;
     }
 #endif
@@ -232,6 +242,10 @@ Java_com_yunsmall_usbipdcpp_UsbIpNative_setLogCallbackImpl(JNIEnv* env, jobject 
         spdlog::set_pattern("[%H:%M:%S] [%l] %v");
 
         __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Log callback set");
+#ifdef USBIPDCPP_LIBUSB_DEBUG_LOGS
+        jni_log::log_callback(spdlog::level::info,
+                              "[libusb] errno diagnostics enabled: warnings/errors are shown here");
+#endif
     } catch (const std::exception& e) {
         if (callback_ref_owned) {
             env->DeleteGlobalRef(callback_global);

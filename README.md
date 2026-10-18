@@ -101,12 +101,23 @@ adb -s <POCO_SERIAL> install -r app-debug.apk
 Debug APKs enable `LIBUSB_LOG_LEVEL_DEBUG` before libusb initialization and forward
 the original messages directly to logcat with tag `UsbIpLibusb`, using the
 [libusb log callback API](https://libusb.sourceforge.io/api-1.0/group__libusb__lib.html).
-This avoids JNI/UI work on libusb threads and preserves `errno` around the callback.
+Warnings and errors are also forwarded to the existing in-app log callback with a
+`[libusb]` prefix; the original `submiturb failed, errno=XX` message is included.
+Verbose DEBUG/INFO traffic stays in logcat to avoid flooding the UI. The callback
+preserves `errno` and catches C++ exceptions before returning to libusb.
 The verbose native logging is enabled by the Debug build's CMake argument
 `USBIPDCPP_LIBUSB_DEBUG_LOGS=ON`; it is off by default for Release builds.
 The existing two library patches and transfer handling are unchanged.
 
-Connect ADB (USB or already paired wireless debugging), then run this in PowerShell
+For capture without ADB, keep the Android app open, confirm
+`[libusb] errno diagnostics enabled: warnings/errors are shown here` in its log,
+reproduce the Windows Camera issue, then immediately press the app's **Copy** log
+button and save/share the copied text. Look for `[libusb] ... submiturb failed, errno=XX`
+alongside the existing `submit failed:` request details. The in-app log retains only
+the latest 500 entries, so copy it promptly. Messages emitted while the UI callback
+is not registered are available only in logcat.
+
+For a full DEBUG capture, connect ADB (USB or already paired wireless debugging), then run this in PowerShell
 **before opening the Android app**. With multiple ADB devices, add `-s <POCO_SERIAL>`
 immediately after `adb` in each command.
 
