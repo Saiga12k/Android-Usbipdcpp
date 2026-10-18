@@ -50,6 +50,11 @@ add_library(usbipdcpp_native SHARED
     jni_log_callback.cpp
 )
 
+option(USBIPDCPP_LIBUSB_DEBUG_LOGS "Forward libusb DEBUG logs to Android logcat" OFF)
+if (USBIPDCPP_LIBUSB_DEBUG_LOGS)
+    target_compile_definitions(usbipdcpp_native PRIVATE USBIPDCPP_LIBUSB_DEBUG_LOGS=1)
+endif ()
+
 target_link_libraries(usbipdcpp_native
     usbipdcpp
     usbipdcpp_libusb

@@ -2,6 +2,7 @@
 #include <android/log.h>
 #include <memory>
 #include <mutex>
+#include <cerrno>
 #include <libusb-1.0/libusb.h>
 
 #include <spdlog/spdlog.h>
@@ -32,6 +33,23 @@ namespace ErrorCode {
 }
 
 namespace {
+#ifdef USBIPDCPP_LIBUSB_DEBUG_LOGS
+    // Write directly to logcat: avoid JNI/UI work on libusb's transfer/event threads.
+    void LIBUSB_CALL libusb_logcat_callback(libusb_context*, libusb_log_level level, const char* message) {
+        const int saved_errno = errno;
+        int priority;
+        switch (level) {
+            case LIBUSB_LOG_LEVEL_ERROR: priority = ANDROID_LOG_ERROR; break;
+            case LIBUSB_LOG_LEVEL_WARNING: priority = ANDROID_LOG_WARN; break;
+            case LIBUSB_LOG_LEVEL_INFO: priority = ANDROID_LOG_INFO; break;
+            case LIBUSB_LOG_LEVEL_DEBUG: priority = ANDROID_LOG_DEBUG; break;
+            default: return;
+        }
+        __android_log_write(priority, "UsbIpLibusb", message);
+        errno = saved_errno;
+    }
+#endif
+
     std::mutex g_server_mutex;
     // Lock discipline: do not call paths that can return through JNI callbacks to native entry points; they would reenter this lock
     //(std::mutex is nonrecursive, causing same-thread deadlock). spdlog output is an exception: it uses jni_log's own
@@ -56,6 +74,15 @@ namespace {
         if (g_initialized) {
             return true;
         }
+#ifdef USBIPDCPP_LIBUSB_DEBUG_LOGS
+        // Register globally before init so initialization and context logs both reach logcat.
+        libusb_set_log_cb(nullptr, libusb_logcat_callback, LIBUSB_LOG_CB_GLOBAL);
+        const int log_error = libusb_set_option(nullptr, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_DEBUG);
+        if (log_error < 0) {
+            __android_log_print(ANDROID_LOG_ERROR, "UsbIpLibusb", "Failed to enable libusb DEBUG logging: %s",
+                                libusb_strerror(log_error));
+        }
+#endif
         libusb_set_option(nullptr, LIBUSB_OPTION_WEAK_AUTHORITY);
         int err = libusb_init(nullptr);
         if (err < 0) {
@@ -63,6 +90,14 @@ namespace {
             // Leave the flag unset to allow retry on the next call.
             return false;
         }
+#ifdef USBIPDCPP_LIBUSB_DEBUG_LOGS
+        if (log_error == 0) {
+            const auto* version = libusb_get_version();
+            __android_log_print(ANDROID_LOG_INFO, "UsbIpLibusb",
+                                "libusb %u.%u.%u DEBUG logging enabled",
+                                version->major, version->minor, version->micro);
+        }
+#endif
         g_initialized = true;
         return true;
     }

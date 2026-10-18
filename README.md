@@ -96,6 +96,37 @@ adb devices
 adb -s <POCO_SERIAL> install -r app-debug.apk
 ```
 
+### Capture libusb errno on POCO F7
+
+Debug APKs enable `LIBUSB_LOG_LEVEL_DEBUG` before libusb initialization and forward
+the original messages directly to logcat with tag `UsbIpLibusb`, using the
+[libusb log callback API](https://libusb.sourceforge.io/api-1.0/group__libusb__lib.html).
+This avoids JNI/UI work on libusb threads and preserves `errno` around the callback.
+The verbose native logging is enabled by the Debug build's CMake argument
+`USBIPDCPP_LIBUSB_DEBUG_LOGS=ON`; it is off by default for Release builds.
+The existing two library patches and transfer handling are unchanged.
+
+Connect ADB (USB or already paired wireless debugging), then run this in PowerShell
+**before opening the Android app**. With multiple ADB devices, add `-s <POCO_SERIAL>`
+immediately after `adb` in each command.
+
+```powershell
+adb logcat -v threadtime 'UsbIpLibusb:V' 'UsbIpNative:V' 'libusb:V' '*:S' > .\usbip-libusb-errno.txt
+```
+
+Open the app, start/bind the C920n, attach from Windows, and reproduce the camera
+streaming issue. Stop capture with Ctrl+C, then extract the key lines:
+
+```powershell
+Select-String -Path .\usbip-libusb-errno.txt -Pattern 'DEBUG logging enabled|submiturb failed|errno=|submit failed:' -Context 3,3
+```
+
+The startup marker `libusb <version> DEBUG logging enabled` confirms that this
+diagnostic build initialized logging. The Linux backend's `submiturb failed, errno=XX`
+message records the OS error; the nearby existing `submit failed:` line contains the
+USB/IP sequence number and ISO request parameters. Keep the full capture for context.
+If the issue does not reproduce, an errno line may not appear.
+
 ## 📄 License
 
 [GPL-3.0](LICENSE)

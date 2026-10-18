@@ -46,6 +46,13 @@ android {
     }
 
     buildTypes {
+        debug {
+            externalNativeBuild {
+                cmake {
+                    arguments += "-DUSBIPDCPP_LIBUSB_DEBUG_LOGS=ON"
+                }
+            }
+        }
         release {
             if (keystorePath != null) {
                 signingConfig = signingConfigs.getByName("ci")
