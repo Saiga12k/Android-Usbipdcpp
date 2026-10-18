@@ -24,6 +24,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply usbipdcpp patches
+        run: bash scripts/apply-usbipdcpp-patches.sh
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:

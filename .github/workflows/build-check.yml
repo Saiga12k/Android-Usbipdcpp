@@ -23,6 +23,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply usbipdcpp patches
+        run: bash scripts/apply-usbipdcpp-patches.sh
+
       - name: Verify JNI error codes match the Kotlin mirror
         run: |
           # ErrorCode is mirrored across languages (C++ values pass unchanged through JNI to Kotlin). Comments on both sides

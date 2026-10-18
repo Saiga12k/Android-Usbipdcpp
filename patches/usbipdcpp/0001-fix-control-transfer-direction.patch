@@ -1,0 +1,26 @@
+From: Android-Usbipdcpp maintainers
+Subject: [PATCH] Determine control-transfer direction from bmRequestType
+
+Base: electronixg/usbipdcpp 379f1ad1d45f8a28b2d2c2822a66971b4f20476c
+
+Control transfers use endpoint zero even for IN requests. Inspect the setup
+packet so USBIP_RET_SUBMIT includes the data stage (such as GET_DESCRIPTOR).
+Keep endpoint-based direction checks for bulk, interrupt and isochronous I/O.
+
+diff --git a/src/LibusbHandler/LibusbTransferOperator.cpp b/src/LibusbHandler/LibusbTransferOperator.cpp
+--- a/src/LibusbHandler/LibusbTransferOperator.cpp
++++ b/src/LibusbHandler/LibusbTransferOperator.cpp
+@@ -93,7 +93,12 @@ std::size_t LibusbTransferOperator::get_actual_length(void *handle) {
+ 
+ bool LibusbTransferOperator::transfer_is_in(void *handle) {
+     auto *trx = static_cast<libusb_transfer *>(handle);
+-    // Direction follows the endpoint used for libusb submission (the same basis as send_transfer_data's internal check)
++
++    if (trx->type == LIBUSB_TRANSFER_TYPE_CONTROL) {
++        const auto *setup = libusb_control_transfer_get_setup(trx);
++        return (setup->bmRequestType & LIBUSB_ENDPOINT_IN) != 0;
++    }
++
+     return (trx->endpoint & LIBUSB_ENDPOINT_IN) != 0;
+ }
+ 
