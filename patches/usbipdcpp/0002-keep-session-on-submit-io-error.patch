@@ -1,0 +1,66 @@
+From: Android-Usbipdcpp maintainers
+Subject: [PATCH] Keep sessions on submit I/O errors and log failed transfers
+
+Base: electronixg/usbipdcpp 379f1ad1d45f8a28b2d2c2822a66971b4f20476c
+Applies after 0001-fix-control-transfer-direction.patch.
+
+A generic LIBUSB_ERROR_IO does not imply physical removal. Preserve EPIPE
+responses for failed URBs and explicit synchronous/asynchronous NO_DEVICE
+detection. Log submission parameters only on failure, before freeing the URB.
+
+diff --git a/src/LibusbHandler/LibusbDeviceHandler.cpp b/src/LibusbHandler/LibusbDeviceHandler.cpp
+index 5d452cd..3183e82 100644
+--- a/src/LibusbHandler/LibusbDeviceHandler.cpp
++++ b/src/LibusbHandler/LibusbDeviceHandler.cpp
+@@ -215,7 +215,9 @@ void usbipdcpp::LibusbDeviceHandler::receive_urb(UsbIpCommand::UsbIpCmdSubmit cm
+             auto err = libusb_submit_transfer(trx);
+ 
+             if (err < 0) [[unlikely]] {
+-                SPDLOG_ERROR("Control transfer to device failed: {}", libusb_strerror(err));
++                SPDLOG_ERROR("submit failed: seq={} ep=0x{:02x} type=Control direction={} length={} error={} ({})",
++                             seqnum, ep.address, setup_packet.is_out() ? "OUT" : "IN",
++                             transfer_buffer_length, err, libusb_strerror(err));
+                 {
+                     std::lock_guard lock(transfers_mutex_);
+                     if (transfers_.erase(seqnum)) {
+@@ -242,7 +244,8 @@ void usbipdcpp::LibusbDeviceHandler::receive_urb(UsbIpCommand::UsbIpCmdSubmit cm
+                 }
+                 responder->submit_ret_submit(
+                         UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
+-                if (err == LIBUSB_ERROR_NO_DEVICE || err == LIBUSB_ERROR_IO) [[unlikely]] {
++                // A generic I/O error fails this URB but does not prove physical removal.
++                if (err == LIBUSB_ERROR_NO_DEVICE) [[unlikely]] {
+                     device_removed = true;
+                     ec = make_error_code(ErrorType::NO_DEVICE);
+                 }
+@@ -334,7 +337,19 @@ void usbipdcpp::LibusbDeviceHandler::receive_urb(UsbIpCommand::UsbIpCmdSubmit cm
+ 
+         auto err = libusb_submit_transfer(trx);
+         if (err < 0) [[unlikely]] {
+-            SPDLOG_ERROR("Transfer failed, {}", libusb_strerror(err));
++            const char *transfer_type = "Unknown";
++            switch (trx->type) {
++                case LIBUSB_TRANSFER_TYPE_BULK: transfer_type = "Bulk"; break;
++                case LIBUSB_TRANSFER_TYPE_INTERRUPT: transfer_type = "Interrupt"; break;
++                case LIBUSB_TRANSFER_TYPE_ISOCHRONOUS: transfer_type = "ISO"; break;
++            }
++            const bool is_iso = trx->type == LIBUSB_TRANSFER_TYPE_ISOCHRONOUS;
++            SPDLOG_ERROR("submit failed: seq={} ep=0x{:02x} type={} direction={} length={} "
++                         "iso_packets={} packet_length={} error={} ({})",
++                         seqnum, trx->endpoint, transfer_type, is_out ? "OUT" : "IN", transfer_buffer_length,
++                         is_iso ? trx->num_iso_packets : 0,
++                         is_iso && trx->num_iso_packets > 0 ? trx->iso_packet_desc[0].length : 0,
++                         err, libusb_strerror(err));
+             {
+                 std::lock_guard lock(transfers_mutex_);
+                 if (transfers_.erase(seqnum)) {
+@@ -350,7 +365,8 @@ void usbipdcpp::LibusbDeviceHandler::receive_urb(UsbIpCommand::UsbIpCmdSubmit cm
+                 delete callback_args;
+             }
+             responder->submit_ret_submit(UsbIpResponse::UsbIpRetSubmit::create_ret_submit_epipe_without_data(seqnum, 0));
+-            if (err == LIBUSB_ERROR_NO_DEVICE || err == LIBUSB_ERROR_IO) [[unlikely]] {
++            // A generic I/O error fails this URB but does not prove physical removal.
++            if (err == LIBUSB_ERROR_NO_DEVICE) [[unlikely]] {
+                 device_removed = true;
+                 ec = make_error_code(ErrorType::NO_DEVICE);
+             }

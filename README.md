@@ -44,7 +44,7 @@ cd Android-Usbipdcpp
 # Or if already cloned, initialize submodules
 git submodule update --init --recursive
 
-# Apply the tracked library fix before building (also safe to run again)
+# Apply the tracked library fixes before building (also safe to run again)
 bash scripts/apply-usbipdcpp-patches.sh
 
 # Build with Android Studio (NDK required)
@@ -64,12 +64,28 @@ which uses the USB device address for `dev_num` in Android's file-descriptor bin
 direction detection. This allows successful IN control replies to include their data
 stage, including the device descriptor requested during Windows enumeration.
 
-All three GitHub Actions workflows apply the patch immediately after recursive
-checkout, before Gradle/CMake compile the library. The script accepts an already
-applied patch and fails on conflicts. The resulting modified submodule working tree
+`patches/usbipdcpp/0002-keep-session-on-submit-io-error.patch` keeps a failed
+`libusb_submit_transfer()` with `LIBUSB_ERROR_IO` from marking the device as physically
+removed, in both control and non-control paths. The failed URB still receives the
+existing EPIPE response. Explicit `LIBUSB_ERROR_NO_DEVICE` and asynchronous
+`LIBUSB_TRANSFER_NO_DEVICE` removal handling are preserved. This is a diagnostic fix;
+it does not resolve the underlying I/O error or change ISO transfer scheduling.
+
+Submission failures now log `seq`, endpoint address, transfer type, direction, requested
+data length, and the numeric/text libusb error before releasing the transfer. For
+non-control transfers the log also includes `iso_packets` and `packet_length` (the
+first ISO packet's length; both fields are zero for non-ISO transfers). For example:
+
+```text
+submit failed: seq=1234 ep=0x81 type=ISO direction=IN length=393216 iso_packets=128 packet_length=3072 error=-1 (Input/Output Error)
+```
+
+All three GitHub Actions workflows apply the numbered patches in filename order
+immediately after recursive checkout, before Gradle/CMake compile the library.
+The script accepts already applied patches and fails on conflicts. The resulting modified submodule working tree
 is expected; the parent repository stores the fix as a patch rather than an unpublished
-submodule commit. After updating the library, review this patch against the new source;
-remove it and its application steps once the fix is available upstream.
+submodule commit. After updating the library, review these patches against the new source;
+remove each patch once its fix is available upstream.
 
 To generate a Debug APK, run the existing **Build APK** workflow with `build_type=debug`.
 It uses JDK 17 and NDK `29.0.14033849`, and uploads the APK as `usbipdcpp-debug`.
