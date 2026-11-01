@@ -13,8 +13,8 @@ android {
 
     defaultConfig {
         applicationId = "com.yunsmall.usbipdcpp"
-        minSdk = 28
-        targetSdk = 36
+        minSdk = 27
+        targetSdk = 27
         versionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 1
         versionName = (project.findProperty("versionName") as? String) ?: "0.0.9"
 
