@@ -1,4 +1,4 @@
-# 提交与 PR 的编译验证：只构建 debug，不发布任何产物
+# Build and retain debug validation APKs for the standard and KM6 configurations.
 name: Build Check
 
 on:
@@ -16,6 +16,10 @@ jobs:
   build:
     name: Build Debug APK
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        km6_compat: [false, true]
 
     steps:
       - name: 检出代码（含子模块）
@@ -89,12 +93,12 @@ jobs:
       - name: 编译 Debug APK
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug
+          ./gradlew assembleDebug -Pkm6Compat=${{ matrix.km6_compat }}
 
       - name: 上传 Debug APK
         uses: actions/upload-artifact@v4
         with:
           # 编译已经花了几分钟，导出产物只需几秒；带 sha 便于区分是哪次提交的
-          name: usbipdcpp-debug-${{ github.sha }}
+          name: usbipdcpp-debug${{ matrix.km6_compat && '-km6' || '' }}-${{ github.sha }}
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
