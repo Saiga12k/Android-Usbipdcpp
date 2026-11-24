@@ -2,6 +2,17 @@
 #include <android/log.h>
 #include <memory>
 #include <mutex>
+#ifdef USBIPDCPP_ANDROID_ISO_DIAGNOSTICS
+#include <cerrno>
+#include <charconv>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <string_view>
+#include <utility>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include <libusb-1.0/libusb.h>
 
 #include <spdlog/spdlog.h>
@@ -32,6 +43,52 @@ namespace ErrorCode {
 }
 
 namespace {
+#ifdef USBIPDCPP_ANDROID_ISO_DIAGNOSTICS
+    std::mutex iso_journal_mutex;
+    char iso_journal_path[512]{};
+    thread_local int iso_submit_errno = 0;
+
+    int take_iso_submit_errno() noexcept {
+        return std::exchange(iso_submit_errno, 0);
+    }
+
+    void LIBUSB_CALL capture_iso_submit_errno(libusb_context*, libusb_log_level level,
+                                             const char* message) noexcept {
+        if (level != LIBUSB_LOG_LEVEL_ERROR || !strstr(message, "[submit_iso_transfer]")) return;
+        constexpr std::string_view marker = "submiturb failed, errno=";
+        if (const char* number = strstr(message, marker.data())) {
+            number += marker.size();
+            const int saved_errno = errno;
+            std::from_chars(number, number + strlen(number), iso_submit_errno);
+            errno = saved_errno;
+        }
+    }
+
+    void append_iso_diagnostic(std::string_view line) noexcept {
+        try {
+            std::lock_guard lock(iso_journal_mutex);
+            if (!iso_journal_path[0]) return;
+            struct stat info {};
+            if (stat(iso_journal_path, &info) == 0 && info.st_size >= 512 * 1024) {
+                char previous[sizeof(iso_journal_path) + 5];
+                snprintf(previous, sizeof(previous), "%s.prev", iso_journal_path);
+                if (rename(iso_journal_path, previous) != 0) return;
+            }
+            if (auto* output = fopen(iso_journal_path, "a")) {
+                timespec timestamp{};
+                clock_gettime(CLOCK_REALTIME, &timestamp);
+                fprintf(output, "%lld.%03ld pid=%d tid=%d ", static_cast<long long>(timestamp.tv_sec),
+                        timestamp.tv_nsec / 1000000, getpid(), gettid());
+                fwrite(line.data(), 1, line.size(), output);
+                fputc('\n', output);
+                fclose(output);
+            }
+        } catch (...) {
+            // Diagnostics must not interrupt USB/IP transfers or cleanup.
+        }
+    }
+#endif
+
     std::mutex g_server_mutex;
     // 锁内纪律：不得调用可能经 JNI 回调再回 native 入口的路径——那会重入本锁
     //（std::mutex 非递归，同线程死锁）。spdlog 输出例外：它经 jni_log 自己的
@@ -56,6 +113,14 @@ namespace {
         if (g_initialized) {
             return true;
         }
+#ifdef USBIPDCPP_ANDROID_ISO_DIAGNOSTICS
+        libusb_set_log_cb(nullptr, capture_iso_submit_errno, LIBUSB_LOG_CB_GLOBAL);
+        const int log_error = libusb_set_option(nullptr, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_WARNING);
+        if (log_error < 0) {
+            __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "Cannot enable ISO errno logging: %s",
+                                libusb_strerror(log_error));
+        }
+#endif
         libusb_set_option(nullptr, LIBUSB_OPTION_WEAK_AUTHORITY);
         int err = libusb_init(nullptr);
         if (err < 0) {
@@ -101,7 +166,21 @@ JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_yunsmall_usbipdcpp_UsbIpNative_nativeInitImpl(JNIEnv* env, jobject thiz) {
+Java_com_yunsmall_usbipdcpp_UsbIpNative_nativeInitImpl(JNIEnv* env, jobject thiz, jstring journal_path) {
+#ifdef USBIPDCPP_ANDROID_ISO_DIAGNOSTICS
+    if (const char* path = env->GetStringUTFChars(journal_path, nullptr)) {
+        {
+            std::lock_guard lock(iso_journal_mutex);
+            if (strlen(path) < sizeof(iso_journal_path)) {
+                snprintf(iso_journal_path, sizeof(iso_journal_path), "%s", path);
+            }
+        }
+        env->ReleaseStringUTFChars(journal_path, path);
+        append_iso_diagnostic("journal_ready");
+    } else {
+        env->ExceptionClear();
+    }
+#endif
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Initializing native layer");
 
     // 初始化全程持 g_server_mutex：并发调用只有一个真正执行，其余在锁上等到做完后
@@ -417,6 +496,10 @@ Java_com_yunsmall_usbipdcpp_UsbIpNative_startServerImpl(JNIEnv* env, jobject thi
         usbipdcpp::LibusbServerConfig config;
         config.device_handler_config.submit_error_policy =
                 usbipdcpp::LibusbSubmitErrorPolicy::DisconnectOnDeviceGone;
+#ifdef USBIPDCPP_ANDROID_ISO_DIAGNOSTICS
+        config.device_handler_config.report_iso_diagnostic = append_iso_diagnostic;
+        config.device_handler_config.take_iso_submit_errno = take_iso_submit_errno;
+#endif
         g_server = std::make_unique<usbipdcpp::LibusbServer>(config);
         g_server->set_hotplug_enabled(false);
         asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v4(), static_cast<unsigned short>(port));

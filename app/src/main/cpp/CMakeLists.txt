@@ -23,7 +23,7 @@ if (ANDROID_ABI STREQUAL "x86")
 elseif (ANDROID_ABI STREQUAL "x86_64")
     set(VCPKG_TARGET_TRIPLET "x64-android")
 elseif (ANDROID_ABI STREQUAL "armeabi-v7a")
-    set(VCPKG_TARGET_TRIPLET "arm-android")
+    set(VCPKG_TARGET_TRIPLET "arm-neon-android")
 elseif (ANDROID_ABI STREQUAL "arm64-v8a")
     set(VCPKG_TARGET_TRIPLET "arm64-android")
 endif ()
@@ -49,6 +49,11 @@ add_library(usbipdcpp_native SHARED
     usbipd_jni.cpp
     jni_log_callback.cpp
 )
+
+option(USBIPDCPP_ANDROID_ISO_DIAGNOSTICS "Persist debug ISO telemetry on Android" OFF)
+if (USBIPDCPP_ANDROID_ISO_DIAGNOSTICS)
+    target_compile_definitions(usbipdcpp_native PRIVATE USBIPDCPP_ANDROID_ISO_DIAGNOSTICS=1)
+endif ()
 
 target_link_libraries(usbipdcpp_native
     usbipdcpp

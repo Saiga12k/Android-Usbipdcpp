@@ -12,7 +12,7 @@ class AppSettings(context: Context) {
 
     /** 曾共享过的设备重新插入时是否自动绑定；默认开启 */
     var autoBindRememberedDevices: Boolean
-        get() = prefs.getBoolean(KEY_AUTO_BIND_REMEMBERED_DEVICES, true)
+        get() = prefs.getBoolean(KEY_AUTO_BIND_REMEMBERED_DEVICES, !BuildConfig.KM6_COMPAT)
         set(value) {
             prefs.edit().putBoolean(KEY_AUTO_BIND_REMEMBERED_DEVICES, value).apply()
         }
