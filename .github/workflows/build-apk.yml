@@ -12,6 +12,10 @@ on:
         options:
           - debug
           - release
+      km6_compat:
+        description: 'Build the KM6 Android 10 compatibility APK'
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -69,7 +73,7 @@ jobs:
       - name: 编译 APK
         run: |
           chmod +x gradlew
-          ./gradlew assemble${{ inputs.build_type == 'debug' && 'Debug' || 'Release' }}
+          ./gradlew assemble${{ inputs.build_type == 'debug' && 'Debug' || 'Release' }} -Pkm6Compat=${{ inputs.km6_compat }}
 
       - name: 上传 artifact
         uses: actions/upload-artifact@v4

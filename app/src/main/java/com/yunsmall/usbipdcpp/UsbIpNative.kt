@@ -90,7 +90,7 @@ object UsbIpNative {
     // ==================== JNI 实现，全部私有 ====================
     // 库没加载成功时 JNI 调用会抛 UnsatisfiedLinkError（冷启动崩溃的根因），
     // 守卫统一收在下面的公开方法里：分散到各调用点判断，漏一处就是崩溃
-    private external fun nativeInitImpl(): Boolean
+    private external fun nativeInitImpl(isoJournalPath: String): Boolean
     private external fun setLogCallbackImpl(callback: LogCallback?)
     private external fun bindUsbDeviceImpl(fd: Int, vendorId: Int, productId: Int, outBusid: Array<String?>): Int
     private external fun unbindUsbDeviceImpl(fd: Int): Int
@@ -120,9 +120,9 @@ object UsbIpNative {
      * 初始化 native 层。返回 false 表示 native 不可用（库加载或 libusb 初始化失败），
      * 调用方必须跳过后续所有 native 操作
      */
-    suspend fun init(): Boolean {
+    suspend fun init(isoJournalPath: String): Boolean {
         if (!libraryLoaded) return false
-        return withContext(jniContext) { nativeInitImpl() }
+        return withContext(jniContext) { nativeInitImpl(isoJournalPath) }
     }
 
     /**

@@ -158,7 +158,7 @@ class UsbService : Service() {
         createNotificationChannel()
         // native 初始化含库加载与 libusb 初始化，放 native 线程执行不阻塞主线程
         serviceScope.launch {
-            val ready = UsbIpNative.init()
+            val ready = UsbIpNative.init(filesDir.resolve("iso-diagnostics.log").absolutePath)
             _state.update { it.copy(nativeReady = ready) }
             if (!ready) {
                 Log.e(TAG, "Native initialization failed, USB/IP features unavailable")

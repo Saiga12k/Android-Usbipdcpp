@@ -3,6 +3,8 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+val km6Compat = providers.gradleProperty("km6Compat").orNull == "true"
+
 android {
     namespace = "com.yunsmall.usbipdcpp"
     compileSdk {
@@ -14,7 +16,9 @@ android {
     defaultConfig {
         applicationId = "com.yunsmall.usbipdcpp"
         minSdk = 28
-        targetSdk = 36
+        // KM6's Android 10 firmware rejects UVC access for the modern target SDK.
+        targetSdk = if (km6Compat) 27 else 36
+        buildConfigField("boolean", "KM6_COMPAT", km6Compat.toString())
         versionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 1
         versionName = (project.findProperty("versionName") as? String) ?: "0.0.12"
 
@@ -28,7 +32,7 @@ android {
                     "-DANDROID_STL=c++_shared",
                     "-DCMAKE_BUILD_PARALLEL_LEVEL=$cores",
                 )
-                abiFilters += listOf("arm64-v8a","x86_64")
+                abiFilters += if (km6Compat) listOf("armeabi-v7a") else listOf("arm64-v8a", "x86_64")
             }
         }
     }
@@ -46,6 +50,13 @@ android {
     }
 
     buildTypes {
+        debug {
+            externalNativeBuild {
+                cmake {
+                    arguments += "-DUSBIPDCPP_ANDROID_ISO_DIAGNOSTICS=ON"
+                }
+            }
+        }
         release {
             if (keystorePath != null) {
                 signingConfig = signingConfigs.getByName("ci")
@@ -62,6 +73,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
     }
     buildFeatures {
+        buildConfig = true
         compose = true
     }
 
